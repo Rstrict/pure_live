@@ -10,8 +10,8 @@ enum PlayerPresetId {
   /// Engine defaults; the app only adds its live-stream tuning table.
   balanced,
 
-  /// Android compatibility: `mediacodec_embed` surface + `mediacodec`
-  /// decode, for devices where the default surface path glitches.
+  /// Android compatibility: `mediacodec` decode for devices where the default
+  /// surface path glitches.
   compat,
 
   /// NVIDIA RTX Video Super Resolution on Windows (d3d11va + d3d11vpp).
@@ -134,7 +134,9 @@ class PlayerEngineOutput {
       enableCodec: json['enableCodec'] is bool ? json['enableCodec'] as bool : true,
       customPlayerOutput: json['customPlayerOutput'] is bool ? json['customPlayerOutput'] as bool : false,
       videoOutputDriver: json['videoOutputDriver'] is String ? json['videoOutputDriver'] as String : 'auto',
-      videoHardwareDecoder: json['videoHardwareDecoder'] is String ? json['videoHardwareDecoder'] as String : 'auto-safe',
+      videoHardwareDecoder: json['videoHardwareDecoder'] is String
+          ? json['videoHardwareDecoder'] as String
+          : 'auto-safe',
       audioOutputDriver: json['audioOutputDriver'] is String ? json['audioOutputDriver'] as String : 'auto',
       videoSync: json['videoSync'] is String ? json['videoSync'] as String : 'audio',
       interpolation: json['interpolation'] is String ? json['interpolation'] as String : 'no',
@@ -167,20 +169,38 @@ extension PlayerPresetDetail on PlayerPresetId {
 
   /// Manual output picks the preset implies (null = leave the segment's
   /// own value / engine default).
+  ///
+  /// `compat` deliberately pins only `hwdec`. It used to also pin
+  /// `vo: mediacodec_embed`, but the native controller configuration only lets
+  /// `libmpv` through as an explicit `vo` (anything else is dropped and the
+  /// embedded render context keeps drawing into the Flutter texture), so that
+  /// half of the preset never reached the engine while the settings page still
+  /// marked the tile as locked. Declaring only what actually takes effect keeps
+  /// the recipe honest; the decode path it was meant to select is `mediacodec`.
+  ///
+  /// `lowEnd` no longer switches hardware decoding off. Weak hardware is exactly
+  /// where a hardware decoder earns its keep — a phone that cannot decode 1080p
+  /// in software needs the decoder more than a desktop does. The preset keeps its
+  /// memory and thread limits, which are what actually make a weak box stable, and
+  /// leaves `enableCodec` to the user's own switch.
   ({String? vo, String? hwdec, bool? enableCodec}) get outputOverride => switch (this) {
-    PlayerPresetId.compat => (vo: 'mediacodec_embed', hwdec: 'mediacodec', enableCodec: true),
+    PlayerPresetId.compat => (vo: null, hwdec: 'mediacodec', enableCodec: true),
     PlayerPresetId.rtxVsr => (vo: null, hwdec: 'd3d11va', enableCodec: true),
-    PlayerPresetId.lowEnd => (vo: null, hwdec: null, enableCodec: false),
+    PlayerPresetId.lowEnd => (vo: null, hwdec: null, enableCodec: null),
     _ => (vo: null, hwdec: null, enableCodec: null),
   };
 
   /// Output picks this preset takes over, so the settings page can mark
   /// the matching tiles as locked instead of pretending they are free.
+  ///
+  /// `compat` locks only `hwdec` now that it no longer pins a `vo` the native
+  /// controller would discard: a locked tile the preset never applies would
+  /// leave the viewer unable to fix a black screen from the settings page.
   Set<String> get lockedOutputKeys => switch (this) {
-        PlayerPresetId.compat => const {'vo', 'hwdec'},
-        PlayerPresetId.rtxVsr => const {'hwdec'},
-        _ => const {},
-      };
+    PlayerPresetId.compat => const {'hwdec'},
+    PlayerPresetId.rtxVsr => const {'hwdec'},
+    _ => const {},
+  };
 
   /// mpv properties layered on top of the app's live tuning table when
   /// this preset is active. Empty for the balanced baseline.
@@ -194,9 +214,16 @@ extension PlayerPresetDetail on PlayerPresetId {
       'demuxer-max-bytes': '41943040',
       'demuxer-readahead-secs': '4',
     },
+    // "Stable network" asks for more media in hand. The demuxer budget has to
+    // move with it: at the base 96 MiB ceiling a 120 s cache target is
+    // unreachable for anything above ~6.4 Mb/s, so mpv stops at the byte limit
+    // and the larger `cache-secs` becomes a number that never takes effect.
+    // These two values are sized to agree at ~8 Mb/s rather than left to drift.
     PlayerPresetId.stableNetwork => const <String, String>{
       'cache-secs': '120',
       'demuxer-readahead-secs': '30',
+      'demuxer-max-bytes': '251658240',
+      'demuxer-max-back-bytes': '33554432',
       'stream-lavf-o': 'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=7',
     },
     PlayerPresetId.lowLatency => const <String, String>{

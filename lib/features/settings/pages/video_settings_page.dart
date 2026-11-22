@@ -7,6 +7,7 @@ import 'package:pure_live/core/player/core/live_audio_service.dart';
 import 'package:pure_live/features/settings/pages/font_family_manager_page.dart';
 import 'package:pure_live/core/config/app_settings_controller.dart';
 import 'package:pure_live/core/config/player_settings_controller.dart';
+import 'package:pure_live/core/platform/orientation_preference.dart';
 import 'package:pure_live/features/settings/pages/portrait_live_settings_page.dart';
 import 'package:pure_live/features/settings/pages/audience_metric_settings_page.dart';
 
@@ -62,6 +63,7 @@ class _VideoSettingsPageState extends State<VideoSettingsPage> {
 
   TargetPlatform get _platform => widget.platformOverride ?? defaultTargetPlatform;
   bool get _isAndroid => _platform == TargetPlatform.android;
+  bool get _isIOS => _platform == TargetPlatform.iOS;
   bool get _isWindows => _platform == TargetPlatform.windows;
   bool get _isMobile => _platform == TargetPlatform.android || _platform == TargetPlatform.iOS;
   bool get _isDesktop => !_isMobile;
@@ -155,6 +157,23 @@ class _VideoSettingsPageState extends State<VideoSettingsPage> {
 
           context.buildGroupTitle(i18n("playback_behavior_settings")),
           context.buildModernCard([
+            if (_isAndroid || _isIOS)
+              Obx(
+                () => context.buildTile(
+                  title: i18n('orientation_preference'),
+                  subtitle: orientationPreferenceLabel(SettingsService.to.app.orientationPreference),
+                  icon: switch (SettingsService.to.app.orientationPreference) {
+                    OrientationPreference.landscape => Icons.screen_rotation_rounded,
+                    OrientationPreference.portrait => Icons.stay_current_portrait_rounded,
+                    OrientationPreference.system => Icons.screen_lock_rotation_rounded,
+                  },
+                  trailing: Text(
+                    orientationPreferenceLabel(SettingsService.to.app.orientationPreference),
+                    style: TextStyle(color: theme.colorScheme.primary, fontWeight: FontWeight.w600),
+                  ),
+                  onTap: () => _showOrientationPreferenceDialog(context),
+                ),
+              ),
             context.buildTile(
               title: i18n('portrait_live_settings'),
               subtitle: i18n('portrait_live_settings_desc'),
@@ -562,6 +581,82 @@ class _VideoSettingsPageState extends State<VideoSettingsPage> {
     final key = PlayerConsts.resolutionLabelKey(value);
     return key == null ? value : i18n(key);
   }
+
+  /// Lets the viewer pin the screen orientation, or hand it back to the sensor.
+  ///
+  /// Three states rather than a switch, because "off" was ambiguous: it used to
+  /// mean "the app does not ask", which on a large screen turned into "stays
+  /// put" instead of "follows the system". The choice is applied immediately so
+  /// the room behind the dialog rotates as visible feedback.
+  Future<void> _showOrientationPreferenceDialog(BuildContext context) async {
+    if (!mounted) return;
+    if (ModalRoute.of(context)?.isCurrent != true) return;
+    final app = SettingsService.to.app;
+    final selected = app.orientationPreference;
+    final result = await showDialog<OrientationPreference>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        key: const ValueKey('orientation-preference-dialog'),
+        scrollable: true,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+        title: Text(i18n('orientation_preference'), style: AppTextStyles.t16Bold),
+        contentPadding: const EdgeInsets.symmetric(vertical: 12),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: RadioGroup<OrientationPreference>(
+            groupValue: selected,
+            onChanged: (value) {
+              if (value != null) Navigator.of(dialogContext, rootNavigator: true).pop(value);
+            },
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: OrientationPreference.values
+                  .map(
+                    (value) => SimpleDialogOption(
+                      onPressed: () => Navigator.of(dialogContext, rootNavigator: true).pop(value),
+                      child: Row(
+                        children: [
+                          Radio<OrientationPreference>(
+                            value: value,
+                            activeColor: Theme.of(dialogContext).colorScheme.primary,
+                          ),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(orientationPreferenceLabel(value)),
+                                const SizedBox(height: 2),
+                                Text(
+                                  orientationPreferenceDescription(value),
+                                  style: AppTextStyles.t12Muted,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                  .toList(),
+            ),
+          ),
+        ),
+        actionsOverflowDirection: VerticalDirection.down,
+        actionsOverflowButtonSpacing: 8,
+        actions: [
+          TextButton(
+            style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
+            onPressed: () => Navigator.of(dialogContext, rootNavigator: true).pop(),
+            child: Text(i18n('cancel'), style: AppTextStyles.t14Muted),
+          ),
+        ],
+      ),
+    );
+    if (result == null || result == selected) return;
+    await app.setOrientationPreference(result);
+  }
 }
 
 class _WindowsPipResetTile extends StatefulWidget {
@@ -775,3 +870,17 @@ String _formatAsmrDuration(int minutes) {
   if (minutes % 60 == 0) return '${minutes ~/ 60} ${i18n('hour')}';
   return '$minutes ${i18n('minute')}';
 }
+
+/// Short label for an orientation preference, for the row's trailing value.
+String orientationPreferenceLabel(OrientationPreference value) => switch (value) {
+  OrientationPreference.landscape => i18n('orientation_preference_landscape'),
+  OrientationPreference.portrait => i18n('orientation_preference_portrait'),
+  OrientationPreference.system => i18n('orientation_preference_system'),
+};
+
+/// One-line explanation shown under each option in the dialog.
+String orientationPreferenceDescription(OrientationPreference value) => switch (value) {
+  OrientationPreference.landscape => i18n('orientation_preference_landscape_desc'),
+  OrientationPreference.portrait => i18n('orientation_preference_portrait_desc'),
+  OrientationPreference.system => i18n('orientation_preference_system_desc'),
+};

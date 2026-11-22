@@ -5,11 +5,30 @@ import 'package:flutter/foundation.dart';
 import 'package:media_core/media_core.dart';
 import 'package:media_core_fullscreen/media_core_fullscreen.dart';
 import 'package:pure_live/core/index.dart';
+import 'package:pure_live/core/platform/orientation_lock.dart';
+import 'package:pure_live/core/platform/orientation_preference.dart';
 import 'package:pure_live/core/player/kernel/player_kernel_service.dart';
 
 @visibleForTesting
 bool supportsOrientationLockForLogicalDisplay(Size logicalDisplaySize) {
-  return logicalDisplaySize.shortestSide < 600;
+  // The lock used to be refused on any display whose shortest side reached
+  // 600 dp, on the theory that a large screen must be a tablet and tablets do
+  // not need rotating. That test is a screen size, and it says nothing about
+  // whether the device can rotate: a Huawei M6 reports 640 x 1000 dp in
+  // portrait (1600 px at 400 dpi), so the shortest side is 640 — one dp-group
+  // past the cutoff — and `landScape()` returned without ever asking the
+  // platform for a landscape orientation. The visible effect was that
+  // fullscreen simply stayed portrait on that device.
+  //
+  // Size is the wrong signal in both directions: a folded phone can report a
+  // large shortest side, and a 7" tablet is still a rotating Android device.
+  // What the guard needs to exclude is an unfolded large-screen window, and
+  // Android already reports that as a multi-window/desktop mode rather than
+  // through a physical size. Orientation locking is therefore always allowed
+  // here; the platform drops the request when the activity is in a windowing
+  // mode that cannot rotate.
+  assert(logicalDisplaySize.width >= 0 && logicalDisplaySize.height >= 0);
+  return true;
 }
 
 @visibleForTesting
@@ -82,6 +101,13 @@ class WindowService {
     return supportsOrientationLockForLogicalDisplay(logicalSize);
   }
 
+  /// The orientation the viewer asked the app to keep.
+  ///
+  /// Read through the settings service so the fullscreen transition and the
+  /// settings page cannot disagree about which way the screen should be.
+  OrientationPreference get _orientationPreference =>
+      SettingsService.to.app.orientationPreference;
+
   Future<void> landScape() async {
     dynamic document;
     try {
@@ -89,10 +115,11 @@ class WindowService {
         await document.documentElement?.requestFullscreen();
       } else if (Platform.isAndroid || Platform.isIOS) {
         if (!_canApplyMobileOrientationLock()) return;
-        await SystemChrome.setPreferredOrientations([
-          DeviceOrientation.landscapeLeft,
-          DeviceOrientation.landscapeRight,
-        ]);
+        // A viewer who pinned portrait keeps it: fullscreen must respect the
+        // explicit setting instead of overriding it with a guess about how a
+        // video "ought" to be shown.
+        if (_orientationPreference == OrientationPreference.portrait) return;
+        await OrientationLock.apply(OrientationPreference.landscape);
       } else if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
         await doEnterFullScreen();
       }
@@ -104,12 +131,15 @@ class WindowService {
 
   Future<void> verticalScreen() async {
     if (!_canApplyMobileOrientationLock()) return;
-    await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    // Leaving fullscreen restores the *preference*, not an unconditional
+    // portrait: a viewer who pinned landscape should not be spun upright every
+    // time they close the player.
+    await OrientationLock.apply(_orientationPreference);
   }
 
   Future<void> followSystemOrientation() async {
     if (!(Platform.isAndroid || Platform.isIOS)) return;
-    await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[]);
+    await OrientationLock.apply(OrientationPreference.system);
   }
 
   Future<void> doEnterFullScreen() async {

@@ -29,6 +29,7 @@ class MainActivity : AudioServiceActivity() {
         private const val DISPLAY_MODE_CHANNEL = "pure_live/display_mode"
         private const val BACKGROUND_PLAYBACK_CHANNEL = "pure_live/background_playback"
         private const val PREDICTIVE_BACK_CHANNEL = "pure_live/predictive_back"
+private const val MEDIA_CAPABILITY_CHANNEL = "pure_live/media_capability"
         private var playbackWakeLock: PowerManager.WakeLock? = null
         private var playbackWifiLock: WifiManager.WifiLock? = null
         private var activeActivity: WeakReference<MainActivity>? = null
@@ -237,6 +238,25 @@ class MainActivity : AudioServiceActivity() {
 
                     else -> result.notImplemented()
                 }
+            }
+        }
+
+        // Decoder capability is reported by the platform, not guessed from core
+        // count: a device that decodes 1080p60 in hardware and one that falls back
+        // to software look identical from Dart.
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            MEDIA_CAPABILITY_CHANNEL,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "describe" -> {
+                    val width = call.argument<Int>("width") ?: 1920
+                    val height = call.argument<Int>("height") ?: 1080
+                    val frameRate = call.argument<Int>("frameRate") ?: 60
+                    result.success(MediaCapabilityProbe.describe(width, height, frameRate))
+                }
+
+                else -> result.notImplemented()
             }
         }
 

@@ -6,6 +6,8 @@ import 'package:pure_live/core/index.dart';
 import 'package:pure_live/core/consts/app_consts.dart';
 import 'package:pure_live/core/storage/hive_pref_util.dart';
 import 'package:pure_live/core/consts/platform_ids.dart';
+import 'package:pure_live/core/platform/orientation_lock.dart';
+import 'package:pure_live/core/platform/orientation_preference.dart';
 
 class AppSettingsController extends GetxController {
   static const int maxSleepMinutes = 525600;
@@ -46,6 +48,35 @@ class AppSettingsController extends GetxController {
   final RxBool enableAsmrSleepMode = hiveBool('enableAsmrSleepMode', false);
   final RxInt asmrSleepMinutes = hiveInt('asmrSleepMinutes', 60);
   final RxBool enableRotateScreen = hiveBool('enableRotateScreen', false);
+
+  /// What the app should do about screen orientation.
+  ///
+  /// Stored as a string, not an enum index: the three values are a user-facing
+  /// contract, and an index would silently reinterpret a saved preference if a
+  /// value were ever inserted ahead of an existing one.
+  ///
+  /// This decides the *device* orientation, which the fullscreen path then has
+  /// to honour. It is deliberately independent of the per-room portrait
+  /// fullscreen policy: that one picks how a tall source is laid out, this one
+  /// picks which way the tablet is held.
+  late final RxString orientationPreferenceName = hiveString(
+    'orientationPreference',
+    OrientationPreference.system.storageKey,
+  );
+
+  OrientationPreference get orientationPreference =>
+      OrientationPreferenceX.fromStorage(orientationPreferenceName.v);
+
+  /// Applies [preference] right away and remembers it.
+  ///
+  /// Applying immediately is the whole point of the setting: the viewer is
+  /// looking at the room while choosing it, and a preference that only takes
+  /// effect on the next room entry reads as a broken switch.
+  Future<void> setOrientationPreference(OrientationPreference preference) async {
+    orientationPreferenceName.v = preference.storageKey;
+    await OrientationLock.apply(preference);
+  }
+
   final RxBool enableScreenKeepOn = hiveBool('enableScreenKeepOn', true);
   final RxBool enableAutoCheckUpdate = hiveBool('enableAutoCheckUpdate', true);
   final RxBool useGitHubOriginForUpdates = hiveBool('useGitHubOriginForUpdates', false);

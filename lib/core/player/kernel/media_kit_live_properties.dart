@@ -4,6 +4,7 @@ import 'dart:developer' as developer;
 import 'package:media_core/media_core.dart';
 import 'package:media_core_ingest/media_core_ingest.dart' show isHlsManifestUri;
 import 'package:media_core_media_kit/media_core_media_kit.dart';
+import 'package:pure_live/core/player/kernel/media_capability.dart';
 import 'package:pure_live/core/player/kernel/player_preset.dart';
 import 'package:pure_live/core/player/core/playback_proxy_policy.dart';
 import 'package:pure_live/core/player/core/playback_source_hints.dart';
@@ -26,7 +27,88 @@ abstract final class MediaKitLiveProperties {
   static const int cacheSeconds = 30;
   static const int cachePauseWaitSeconds = 4;
 
-  static bool get _lowEnd => _cpuCores <= 4;
+  /// Whether this device should run the reduced-memory table.
+  ///
+  /// Core count alone is a proxy, not a capability: plenty of thin-and-light
+  /// machines have four cores and 16 GiB, and an old tablet can have eight slow
+  /// cores and 2 GiB. The automatic table therefore stays conservative: it only
+  /// drops to the smaller budget on a device that reports very few cores, and
+  /// when the platform reports memory it must also be small.
+  ///
+  /// A device that *reports* no hardware decoder for the common live sizes is
+  /// weak regardless of how many cores it has — that is the case this table exists
+  /// for, and CPU count cannot see it. The reported capability is therefore allowed
+  /// to force the reduced table, but never to lift it: an "unknown" answer means no
+  /// opinion, not "strong enough".
+  ///
+  /// Note that this is only the *automatic* table. An explicit low-end preset is
+  /// the user's own decision and is applied unchanged through
+  /// [PlayerPresetId.extraProperties].
+  static bool get _lowEnd {
+    if (_hardwareDecodeMissing) return true;
+    final cores = _cpuCores;
+    if (cores > 4) return false;
+    final memory = _reportedMemoryBytes;
+    // An unreported size is unknown, not small: treating it as small would move
+    // every desktop that cannot answer onto the reduced table.
+    return memory == 0 || memory < _lowEndMemoryBytes;
+  }
+
+  /// Whether the last probe found a hardware decoder.
+  ///
+  /// Tri-state on purpose: `null` means the platform has not answered (or cannot),
+  /// and an unanswered platform must keep the old heuristic instead of being
+  /// forced onto the reduced table.
+  static bool? _reportedDecodeCapability;
+
+  static bool get _hardwareDecodeMissing => _reportedDecodeCapability == false;
+
+  /// Asks the platform what it can decode and remembers the verdict.
+  ///
+  /// Called once per process before the first player is built. A failure leaves the
+  /// previous answer in place: a missing native channel is not evidence of a weak
+  /// device.
+  static Future<void> probeDecodeCapability() async {
+    try {
+      final capability = await MediaCapabilityService.describe();
+      if (!capability.isAndroid) return;
+      _reportedDecodeCapability = capability.hasHardwareDecoder;
+    } catch (_) {
+      // Keep the optimistic default.
+    }
+  }
+
+  /// Test seam: overrides the reported capability.
+  @visibleForTesting
+  static void debugSetDecodeCapability({required bool hardware}) => _reportedDecodeCapability = hardware;
+
+  /// Test seam: restores the "platform has not answered" state.
+  @visibleForTesting
+  static void debugClearDecodeCapability() => _reportedDecodeCapability = null;
+
+  /// Reserved for devices where 40 MiB of forward buffer is a real cost.
+  static const int _lowEndMemoryBytes = 3 * 1024 * 1024 * 1024;
+
+  /// Physical memory as the platform reports it, or 0 when it does not.
+  ///
+  /// `dart:io` has no portable physical-memory API. Windows and macOS therefore
+  /// answer 0 here and the decision falls back to core count alone, which is the
+  /// behaviour this app had before; Android/Linux keep the extra signal.
+  static int get _reportedMemoryBytes {
+    if (!Platform.isLinux && !Platform.isAndroid) return 0;
+    try {
+      final stat = File('/proc/meminfo').readAsLinesSync();
+      for (final line in stat) {
+        if (!line.startsWith('MemTotal:')) continue;
+        final kilobytes = int.tryParse(line.replaceAll(RegExp(r'[^0-9]'), ''));
+        if (kilobytes == null || kilobytes <= 0) return 0;
+        return kilobytes * 1024;
+      }
+    } catch (_) {
+      // Unreadable /proc (a sandbox, an odd ROM): fall through to "unknown".
+    }
+    return 0;
+  }
 
   static int get _cpuCores {
     try {

@@ -173,14 +173,18 @@ class PlayerSettingsController extends GetxController {
   /// Applies a one-click preset to the current engine x platform segment.
   void applyPreset(PlayerPresetId id) {
     final detail = id.outputOverride;
-    final segment = _segmentForCurrent().copyWith(
+    final current = _segmentForCurrent();
+    // The manual-output gate belongs to the viewer: a preset that pins vo/hwdec
+    // has to arm it, but a preset that pins nothing must not disarm it and throw
+    // away a manual pick. `null` picks therefore keep the segment's own values
+    // instead of being reset to defaults.
+    final pinsOutput = detail.vo != null || detail.hwdec != null;
+    final segment = current.copyWith(
       presetId: id,
       enableCodec: detail.enableCodec,
-      // A preset that pins hwdec alone (RTX: d3d11va) needs the custom-output
-      // gate armed as well, otherwise the pick never reaches the engine.
-      customPlayerOutput: detail.vo != null || detail.hwdec != null,
-      videoOutputDriver: detail.vo ?? 'auto',
-      videoHardwareDecoder: detail.hwdec ?? 'auto-safe',
+      customPlayerOutput: pinsOutput ? true : current.customPlayerOutput,
+      videoOutputDriver: detail.vo ?? current.videoOutputDriver,
+      videoHardwareDecoder: detail.hwdec ?? current.videoHardwareDecoder,
     );
 
     _writeSegment(segment);
