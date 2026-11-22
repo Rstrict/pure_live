@@ -35,6 +35,7 @@ import 'package:pure_live/domains/live/data/platforms/sites.dart';
 import 'package:pure_live/domains/recorder/data/services/niconico_hls_input.dart' show readNiconicoMaster;
 import 'package:pure_live/domains/live/data/favorite_room_controller.dart';
 import 'package:pure_live/domains/live/data/history_controller.dart';
+import 'package:pure_live/core/player/kernel/media_kit_live_properties.dart';
 import 'package:pure_live/shared/platforms/huya/huya_site.dart';
 import 'package:pure_live/domains/live/presentation/tags/tag_management_controller.dart';
 import 'package:pure_live/domains/iptv/data/iptv_settings_controller.dart';
@@ -163,6 +164,11 @@ class InitialServices {
       return CompactSourceOrientation.isPortraitSize(size.width.toDouble(), size.height.toDouble());
     };
     unawaited(HuyaSite().getHuYaUA());
+    // Ask the platform what it can decode before the first player is built. The
+    // answer decides whether the reduced-memory table is used, and core count alone
+    // cannot see a missing hardware decoder. Runs unawaited: the default table is
+    // already the conservative one, so a slow answer must not delay the first frame.
+    unawaited(MediaKitLiveProperties.probeDecodeCapability());
   }
 
   /// Retire the legacy global default so an old backup or persisted value can
