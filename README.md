@@ -108,7 +108,7 @@ mGlobalConfiguration={... w640dp h1000dp ... port ...}     ← App 窗口仍钉�
 ### 6. 已知未验证
 
 - **解码层掉帧/渲染卡顿**：只验证了连续性，没有做帧率量化采样。
-- **`flutter build apk --release`**：本分支未产出正式签名的 release 包（见[下载安装](#-下载安装)）。
+- **正式签名**：release 包已构建并在真机验证（[下载安装](#-下载安装)），但用 debug 证书签名，无法覆盖升级官方版本。
 - **虎牙降档**：实测「楚河」三条线只有 HS 能出流且 7635 → 3874 kbps 下滑 72%，而当前档位是最高档 8000 kbps，供给不足就是卡顿直接原因。降档会改变用户选择，未擅自实施。
 
 ---
@@ -148,30 +148,49 @@ mGlobalConfiguration={... w640dp h1000dp ... port ...}     ← App 窗口仍钉�
 
 ## 📥 下载安装
 
-本分支目前**只产出 debug 构建**用于验证，不提供正式签名的 release APK。
+**[⬇️ 下载 v3.1.19-rstrict.1](https://github.com/Rstrict/pure_live/releases/tag/v3.1.19-rstrict.1)**（Android arm64，release 模式）
 
-原因：`android/app/build.gradle.kts` 的 release 签名读取 `android/key.properties`，要求 `storeFile` / `keyAlias` / `keyPassword` / `storePassword` 齐全。本机没有该文件，也没有仓库专用签名证书——**用临时证书签出的「release」包无法覆盖升级官方版本，签名不一致会安装失败**。这正是本次真机验证时需要先卸载旧版的原因。
+```bash
+adb install pure_live-3.1.19-arm64-release-debugkey.apk
+```
 
-需要正式包时：
+校验：
+
+```bash
+sha256sum -c SHA256SUMS.txt
+# bcc35e4d44a2ad3a7e15b52684c843bfd026dbd3bc6c75115003530206ca7a6c
+```
+
+### ⚠️ 签名说明
+
+这个包是 **release 构建**（R8 压缩 + 资源裁剪，160 MB，非 debug），但用 **debug 证书**签名（`CN=Android Debug`）。
+
+原因是本机没有发布证书：`android/app/build.gradle.kts` 的 release 签名读取 `android/key.properties`，需要 `storeFile` / `keyAlias` / `keyPassword` / `storePassword` 四项齐全。缺文件时构建会回退到 debug 证书并打警告。
+
+**后果**：
+
+- ✅ 功能与正式版一致，可直接安装使用
+- ⚠️ **无法覆盖升级官方版本**，安装前需先卸载旧版（签名不同，`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）
+- ⚠️ 不适合作为长期分发渠道
+
+需要可覆盖升级的正式包时，自备 keystore（**须长期保管，丢失后无法再覆盖升级**）：
 
 ```powershell
-# 1. 准备签名（自建，需长期保管）
-#    android/key.properties:
-#      storeFile=../keystore/pure_live.jks
-#      keyAlias=pure_live
-#      keyPassword=******
-#      storePassword=******
+# android/key.properties:
+#   storeFile=../keystore/pure_live.jks
+#   keyAlias=pure_live
+#   keyPassword=******
+#   storePassword=******
 
-# 2. 构建
 PowerShell -ExecutionPolicy Bypass -File .\tool\build_local_release.ps1 `
   -Target AndroidArm64 -Configuration Release -FullRegression -RequireReleaseSigning
 ```
 
-官方安装包请到上游 [GitHub Releases](https://github.com/liuchuancong/pure_live/releases/latest) 获取，并用同一 Release 的 `SHA256SUMS.txt` 校验。
+官方安装包请到上游 [GitHub Releases](https://github.com/liuchuancong/pure_live/releases/latest) 获取。
 
 | 平台 | 安装包 | 系统要求 |
 | --- | --- | --- |
-| 📱 Android / Android TV | APK（arm64-v8a / armeabi-v7a / x86_64） | Android 8.0（API 26）及以上 |
+| 📱 Android / Android TV | 本分支仅提供 arm64-v8a；完整架构见上游 | Android 8.0（API 26）及以上 |
 | 🖥️ Windows | EXE 安装器 / 便携 ZIP | Windows 10 / 11 x64 |
 | 🍎 macOS | Universal DMG / ZIP | Apple Silicon + Intel |
 | 🐧 Linux | Portable tar.gz | x64 |
@@ -294,6 +313,8 @@ PowerShell -ExecutionPolicy Bypass -File .\tool\local_ci.ps1 -Scope Full
 | Kotlin 全量编译（6 个源文件） | **error = 0** |
 | 真机长连接（华为 M6） | 斗鱼 12 分钟不断流，PID 未变 |
 | 真机横屏（华为 M6） | 全屏 2560×1600 ↔ 竖屏 1600×2560 双向正常 |
+| release 构建（R8 + 资源裁剪） | 160.5 MB，debug 版 332 MB |
+| release 包真机启动 | 界面正常、斗鱼播放、横屏均通过 |
 
 ---
 
