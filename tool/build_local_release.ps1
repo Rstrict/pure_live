@@ -189,6 +189,22 @@ try {
 
         & (Join-Path $PSScriptRoot 'prefetch_android_native.ps1')
 
+        # `pub get` writes every Android plugin into GeneratedPluginRegistrant.java,
+        # including `integration_test`. That package is a dev_dependency SDK
+        # package, so the release variant does not have it on the Java classpath
+        # and javac fails:
+        #
+        #   GeneratedPluginRegistrant.java: <package integration_test does not exist>
+        #
+        # The file is git-ignored and rewritten by the next pub get, so this has
+        # to run here — after dependency resolution, before the build reads it.
+        if ($Configuration -eq 'Release') {
+            & (Join-Path $PSScriptRoot 'strip_dev_plugin_registrant.ps1')
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Failed to remove dev-only plugins from the release plugin registrant.'
+            }
+        }
+
         $androidArgs = @(
             'build', 'apk', "--$configurationLower", '--split-per-abi',
             '--target-platform', 'android-arm64',
