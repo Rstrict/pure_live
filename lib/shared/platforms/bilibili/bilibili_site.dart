@@ -26,6 +26,7 @@ class BiliBiliSite
         LiveSiteRoomRefresher,
         LiveSiteRecordRoomResolver,
         LivePlayUrlResolver,
+        LivePlayRecoveryResolver,
         LiveSiteExternalRoomResolver {
   @override
   RoomExternalTarget? externalRoomTarget(LiveRoom liveroom) {
@@ -173,6 +174,30 @@ class BiliBiliSite
     } catch (e) {
       throw Exception(e.toString());
     }
+  }
+
+  /// Reacquires the room play info so the signed `url_info` extra is current.
+  ///
+  /// Bilibili signs every media address into the `getRoomPlayInfo` answer, and
+  /// the signed query carries an expiry, so recovery cannot replay the quality's
+  /// stored addresses. A single request is enough: it both refreshes the address
+  /// list and states which qn the server actually applied, which is the
+  /// acknowledgement the UI needs after a refresh.
+  ///
+  /// A carousel room carries no quality table at all, so it is resolved through
+  /// the round-play video path instead of being reported as an empty live room.
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+  }) async {
+    final roomId = liveroom.roomId?.trim() ?? '';
+    if (roomId.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    final result = await _requestPlayInfo(liveroom: liveroom, qualityData: quality.data);
+    if (isCarouselResponse(result)) return _resolveCarouselVideo(liveroom);
+    // The answer already names the applied qn, so nothing is inferred here: a
+    // server downgrade surfaces as appliedQualityData != the requested id.
+    return parsePlayUrlResolution(result, requestedQualityData: quality.data);
   }
 
   Future<LivePlayUrlResolution> _resolveCarouselVideo(LiveRoom liveroom) async {

@@ -13,6 +13,7 @@ import 'package:pure_live/core/tars/base_tars_http.dart';
 import 'package:pure_live/core/consts/platform_ids.dart';
 import 'package:pure_live/core/models/live_category.dart';
 import 'package:pure_live/shared/platforms/live_site.dart';
+import 'package:pure_live/shared/platforms/live_line_health.dart';
 import 'package:pure_live/core/release/github_mirror.dart';
 import 'package:pure_live/core/models/live_anchor_item.dart';
 import 'package:pure_live/core/models/live_play_quality.dart';
@@ -330,22 +331,49 @@ class HuyaSite
     // token/template to its own CDN. Huya can roll AntiCode material per line;
     // one malformed or already-expired line must not discard every healthy FLV
     // and HLS alternative returned in the same room snapshot.
+    //
+    // Outcomes are recorded per CDN, because Huya advertises several edges per
+    // room and their reachability differs: a measured room had two edges answer no
+    // bytes at all while the third sustained the stream. The server's line order
+    // cannot express that, so a line that just failed is tried after the ones that
+    // did not.
     final resolved = await Future.wait<String>(
       lines.map((line) async {
         try {
-          return await getPlayUrl(line, bitRate);
+          final url = await getPlayUrl(line, bitRate);
+          if (url.isNotEmpty) lineHealth.recordSuccess(line.cdnType);
+          return url;
         } on Object catch (error) {
+          lineHealth.recordFailure(line.cdnType);
           CoreLog.error('Huya ${line.cdnType} ${line.lineType.name} URL resolve failed: ${error.runtimeType}');
           return '';
         }
       }),
     );
+
+    // Pair each resolved URL with the line that produced it, so ordering can use the
+    // CDN identity rather than the URL text (which changes with every signature).
+    final candidates = <({HuyaLineModel line, String url})>[];
+    for (var index = 0; index < lines.length; index++) {
+      final url = resolved[index];
+      if (url.isEmpty) continue;
+      candidates.add((line: lines[index], url: url));
+    }
+    final ordered = lineHealth.order(candidates, key: (candidate) => candidate.line.cdnType);
+
     final urls = <String>[];
-    for (final url in resolved) {
-      if (url.isNotEmpty && !urls.contains(url)) urls.add(url);
+    for (final candidate in ordered) {
+      if (!urls.contains(candidate.url)) urls.add(candidate.url);
     }
     return urls;
   }
+
+  /// Per-CDN reachability memory for this process.
+  ///
+  /// Exposed for the ordering tests; production code reaches it through
+  /// [getPlayUrls] only.
+  @visibleForTesting
+  static final LiveLineHealth lineHealth = LiveLineHealth();
 
   @override
   Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({

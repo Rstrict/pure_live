@@ -4,6 +4,7 @@ import 'package:pure_live/core/network/http_client.dart';
 import 'package:pure_live/core/consts/platform_ids.dart';
 import 'package:pure_live/core/models/live_category.dart';
 import 'package:pure_live/shared/platforms/live_site.dart';
+import 'package:pure_live/shared/platforms/live_quality_recovery.dart';
 import 'package:pure_live/core/models/live_anchor_item.dart';
 import 'package:pure_live/core/models/live_play_quality.dart';
 import 'package:pure_live/shared/platforms/live_danmaku.dart';
@@ -22,6 +23,7 @@ class CCSite
         LiveSite,
         LiveSiteRoomRefresher,
         LiveSiteRecordRoomResolver,
+        LivePlayRecoveryResolver,
         LiveSiteCategoryDirectoryProvider,
         LiveSiteExternalRoomResolver {
   @override
@@ -246,6 +248,31 @@ class CCSite
     return data.map((item) => item.toString().trim()).where((url) => url.isNotEmpty).toList(growable: false);
   }
 
+  /// Reacquires the channel so the quality table comes from a current response.
+  ///
+  /// CC's playable addresses are built out of the room payload (`quickplay` or
+  /// `stream_list`) while [getPlayUrls] only replays the URL list stored in the
+  /// quality object, so recovery has to fetch the channel again. The requested
+  /// quality key is matched on the fresh table; a key the platform stopped
+  /// advertising means there is no equivalent source, not that the first entry
+  /// is close enough.
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+  }) async {
+    final roomId = liveroom.roomId?.trim() ?? '';
+    if (roomId.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    final fresh = await _loadRoomDetail(roomId);
+    final qualities = await getPlayQualites(liveroom: fresh);
+    final recovered = matchRecoveredQuality(qualities, requestedSelectionId: quality.selectionId);
+    if (recovered == null) return const LivePlayUrlResolution(urls: <String>[]);
+    return LivePlayUrlResolution(
+      urls: await getPlayUrls(liveroom: fresh, quality: recovered),
+      appliedQualityData: recovered.selectionId,
+    );
+  }
+
   @override
   Future<List<LiveRoom>> getRecommendRooms({int page = 1, int pageSize = 30}) async {
     try {
@@ -366,10 +393,7 @@ class CCSite
       userId: roomInfo['cid'].toString(),
       data: roomInfo["quickplay"] ?? roomInfo["stream_list"],
       startedAt: _startedAt(_onAirStatus(live ? LiveStatus.live : LiveStatus.offline, roomInfo['title']), roomInfo),
-      restriction: _restriction(
-        _onAirStatus(live ? LiveStatus.live : LiveStatus.offline, roomInfo['title']),
-        roomInfo,
-      ),
+      restriction: _restriction(_onAirStatus(live ? LiveStatus.live : LiveStatus.offline, roomInfo['title']), roomInfo),
     );
   }
 

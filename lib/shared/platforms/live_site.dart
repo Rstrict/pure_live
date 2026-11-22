@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart' show CancelToken;
 import 'package:pure_live/core/models/live_category.dart';
 import 'package:pure_live/core/models/live_anchor_item.dart';
 import 'package:pure_live/core/models/live_area.dart';
@@ -216,6 +217,31 @@ abstract interface class LivePlayRecoveryResolver {
   });
 }
 
+/// Optional cancellation contract for adapters that resolve several CDN lines
+/// in one pass.
+///
+/// Kept separate from [LivePlayUrlResolver] on purpose: adding an optional
+/// parameter to the shared contract would require every adapter to restate it,
+/// while only the multi-line resolvers have anything to cancel. A room the
+/// viewer already left must stop its in-flight signed requests instead of
+/// leaving the sockets to finish on their own.
+///
+/// Implementations must stop requesting new lines once [cancel] fires, and must
+/// surface the cancellation rather than a generic platform error.
+abstract interface class LivePlayUrlCancellableResolver {
+  Future<LivePlayUrlResolution> resolvePlayUrlsRawCancellable({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+    CancelToken? cancel,
+  });
+
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRawCancellable({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+    CancelToken? cancel,
+  });
+}
+
 /// Optional lease metadata for short-lived signed playback URLs.
 ///
 /// A player can refresh the token before this timestamp rather than waiting for
@@ -347,7 +373,28 @@ class LiveSite {
 /// the requested quality was applied.
 extension LiveSitePlayUrlResolution on LiveSite {
   Future<LivePlayUrlResolution> resolvePlayUrls({required LiveRoom liveroom, required LivePlayQuality quality}) async {
+    return resolvePlayUrlsCancellable(liveroom: liveroom, quality: quality, cancel: null);
+  }
+
+  /// [resolvePlayUrls] with a cancellation source.
+  ///
+  /// Only the adapters that implement [LivePlayUrlCancellableResolver] observe
+  /// [cancel]; every other platform keeps its existing behaviour.
+  Future<LivePlayUrlResolution> resolvePlayUrlsCancellable({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+    CancelToken? cancel,
+  }) async {
     final site = this;
+
+    if (site is LivePlayUrlCancellableResolver) {
+      final resolution = await (site as LivePlayUrlCancellableResolver).resolvePlayUrlsRawCancellable(
+        liveroom: liveroom,
+        quality: quality,
+        cancel: cancel,
+      );
+      return resolution.normalized();
+    }
 
     if (site is LivePlayUrlResolver) {
       final resolver = site as LivePlayUrlResolver;
@@ -372,7 +419,24 @@ extension LiveSitePlayUrlResolution on LiveSite {
     required LiveRoom liveroom,
     required LivePlayQuality quality,
   }) async {
+    return resolvePlayUrlsForRecoveryCancellable(liveroom: liveroom, quality: quality, cancel: null);
+  }
+
+  /// [resolvePlayUrlsForRecovery] with a cancellation source.
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryCancellable({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+    CancelToken? cancel,
+  }) async {
     final site = this;
+    if (site is LivePlayUrlCancellableResolver) {
+      final resolution = await (site as LivePlayUrlCancellableResolver).resolvePlayUrlsForRecoveryRawCancellable(
+        liveroom: liveroom,
+        quality: quality,
+        cancel: cancel,
+      );
+      return resolution.normalized();
+    }
     if (site is LivePlayRecoveryResolver) {
       final resolution = await (site as LivePlayRecoveryResolver).resolvePlayUrlsForRecoveryRaw(
         liveroom: liveroom,
@@ -380,7 +444,7 @@ extension LiveSitePlayUrlResolution on LiveSite {
       );
       return resolution.normalized();
     }
-    return resolvePlayUrls(liveroom: liveroom, quality: quality);
+    return resolvePlayUrlsCancellable(liveroom: liveroom, quality: quality, cancel: cancel);
   }
 }
 

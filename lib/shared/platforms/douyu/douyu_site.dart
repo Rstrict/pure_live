@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:dio/dio.dart' show CancelToken, DioException, DioExceptionType, RequestOptions;
 import 'package:pure_live/core/index.dart';
 import 'package:html_unescape/html_unescape.dart';
 import 'package:pure_live/core/models/live_category.dart';
@@ -27,6 +29,7 @@ class DouyuSite
         LiveSiteRecordRoomResolver,
         LivePlayUrlResolver,
         LivePlayRecoveryResolver,
+        LivePlayUrlCancellableResolver,
         LivePlayUrlCursorResolver,
         LivePlayLeaseMetadata,
         LiveSiteExternalRoomResolver {
@@ -49,6 +52,127 @@ class DouyuSite
   /// the issue time is remembered when it is resolved.
   static final Map<String, DateTime> _issuedAt = {};
   static const Duration _leaseRefreshLead = Duration(seconds: 45);
+
+  /// How many CDN lines are signed at the same time for one quality.
+  ///
+  /// The room's own line takes the first worker, so a second worker is enough
+  /// to make progress on a neighbour without turning one room open into a burst
+  /// against the platform.
+  static const int cdnConcurrency = 2;
+
+  /// Wall clock for one CDN resolution pass.
+  ///
+  /// Not a per-request timeout: the budget covers waiting for the pool, so a
+  /// line that hangs cannot extend the room open past this. It is longer than a
+  /// single signed request can take (20 s connect + 20 s receive) only when the
+  /// caller's own session renewal is still running; lines that answered are
+  /// returned either way.
+  static const Duration resolutionBudget = Duration(seconds: 12);
+
+  /// When each CDN code last refused a signed request, for this process only.
+  ///
+  /// The static `scdn` prefix rule is a guess from earlier platform behaviour. It
+  /// cannot know that a particular edge is unreachable *from this network* — a
+  /// measured example is an edge whose TLS handshake is refused here while the
+  /// platform keeps advertising it for every room. Recording real outcomes turns
+  /// that guess into evidence: a line that just failed is tried last, and a line
+  /// that just answered is preferred.
+  ///
+  /// Only failures are stored, and only for [cdnFailureMemory]. A later success
+  /// clears the entry, so a transient outage does not exile a healthy edge.
+  static final Map<String, DateTime> _cdnFailedAt = {};
+  static const Duration cdnFailureMemory = Duration(minutes: 10);
+
+  /// Upper bound on tracked codes; the platform advertises a handful per room.
+  static const int _cdnFailureEntries = 32;
+
+  static void _rememberCdnFailure(String cdn, DateTime at) {
+    final code = cdn.trim();
+    if (code.isEmpty) return;
+    _cdnFailedAt.remove(code);
+    _cdnFailedAt[code] = at;
+    while (_cdnFailedAt.length > _cdnFailureEntries) {
+      _cdnFailedAt.remove(_cdnFailedAt.keys.first);
+    }
+  }
+
+  static void _rememberCdnSuccess(String cdn) {
+    _cdnFailedAt.remove(cdn.trim());
+  }
+
+  /// Whether [cdn] refused a request recently enough to be demoted.
+  ///
+  /// The test seam pins the clock so an ordering test does not depend on the
+  /// wall clock.
+  @visibleForTesting
+  static bool cdnRecentlyFailed(String cdn, {DateTime? now}) {
+    final failedAt = _cdnFailedAt[cdn.trim()];
+    if (failedAt == null) return false;
+    final at = now ?? DateTime.now();
+    return at.difference(failedAt) < cdnFailureMemory;
+  }
+
+  /// Clears the failure memory. Test seam and a natural reset point after a
+  /// network change.
+  @visibleForTesting
+  static void clearCdnFailureMemory() => _cdnFailedAt.clear();
+
+  /// Test seam: records a failure without going through a signed request.
+  @visibleForTesting
+  static void debugRecordCdnFailure(String cdn, {DateTime? at}) => _rememberCdnFailure(cdn, at ?? DateTime.now());
+
+  /// Test seam: records a success without going through a signed request.
+  @visibleForTesting
+  static void debugRecordCdnSuccess(String cdn) => _rememberCdnSuccess(cdn);
+
+  /// Orders CDN codes by what this process has observed, then by platform order.
+  ///
+  /// Two rules, in this order:
+  ///
+  /// 1. A code that failed recently sinks below every code that has not. This is
+  ///    the part the `scdn` prefix cannot express: the prefix is a platform-wide
+  ///    guess, while this reflects the network the app is actually on.
+  /// 2. Within each group the platform's own order is kept. The room's `rtmp_cdn`
+  ///    leads (it is where the room streams from), and `scdn*` stays last as the
+  ///    legacy hint that it usually reaches fewer networks.
+  ///
+  /// The list is a preference, not a filter: every advertised line is still
+  /// resolved, so a demoted edge that recovers can be promoted again on the next
+  /// pass.
+  @visibleForTesting
+  static List<String> orderCdns(List<String> cdns, {DateTime? now}) {
+    final at = now ?? DateTime.now();
+    final indexed = <({int index, String code, int rank})>[
+      for (var index = 0; index < cdns.length; index++)
+        (
+          index: index,
+          code: cdns[index],
+          rank: cdnRecentlyFailed(cdns[index], now: at)
+              ? 2
+              : cdns[index].startsWith('scdn')
+              ? 1
+              : 0,
+        ),
+    ];
+    indexed.sort((left, right) {
+      final byRank = left.rank.compareTo(right.rank);
+      return byRank != 0 ? byRank : left.index.compareTo(right.index);
+    });
+    return <String>[for (final entry in indexed) entry.code];
+  }
+
+  /// Test seam for the signed H5 play request.
+  ///
+  /// Replaces the network call, its retry and the session bookkeeping so the
+  /// pool, the budget and the cancellation can be exercised without a platform
+  /// round trip. Production leaves this null.
+  @visibleForTesting
+  static Future<Map<String, dynamic>> Function(String roomId, int rate, String cdn, CancelToken? cancel)?
+  debugPlayDataFetcher;
+
+  /// Test seam for [resolutionBudget]; production uses the constant.
+  @visibleForTesting
+  static Duration? debugResolutionBudget;
 
   static int? _expireSeconds(String url) {
     final value = int.tryParse(Uri.tryParse(url)?.queryParameters['expire'] ?? '');
@@ -183,15 +307,7 @@ class DouyuSite
   Future<List<LivePlayQuality>> getPlayQualites({required LiveRoom liveroom}) async {
     final roomId = liveroom.roomId ?? '';
     final playData = await _requestPlayData(roomId);
-    final cdns = parseCdnCodes(playData);
-    cdns.sort((a, b) {
-      if (a.startsWith("scdn") && !b.startsWith("scdn")) {
-        return 1;
-      } else if (!a.startsWith("scdn") && b.startsWith("scdn")) {
-        return -1;
-      }
-      return 0;
-    });
+    final cdns = orderCdns(parseCdnCodes(playData));
     return parsePlayQualities(playData, cdns);
   }
 
@@ -247,11 +363,19 @@ class DouyuSite
   Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({
     required LiveRoom liveroom,
     required LivePlayQuality quality,
+  }) => resolvePlayUrlsForRecoveryRawCancellable(liveroom: liveroom, quality: quality);
+
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRawCancellable({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+    CancelToken? cancel,
   }) async {
     // Both the signed URL and advertised CDN set can change while a live
     // connection is paused. Refresh the metadata, then ask for the committed
     // rate with those current CDNs rather than reopening the old URL cohort.
     final qualities = await getPlayQualites(liveroom: liveroom);
+    if (cancel?.isCancelled == true) throw _cancelledError(cancel!);
     if (qualities.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
     final requestedId = quality.selectionId.toString();
     final matching = qualities.where((item) => item.selectionId.toString() == requestedId).firstOrNull;
@@ -269,39 +393,115 @@ class DouyuSite
     // A no-longer-advertised rate can still be accepted or downgraded by the
     // server. Preserve that acknowledgement for the successful-source commit;
     // never label a fallback using only the requested rate.
-    return resolvePlayUrlsRaw(liveroom: liveroom, quality: request);
+    return resolvePlayUrlsRawCancellable(liveroom: liveroom, quality: request, cancel: cancel);
   }
 
+  /// Resolves every advertised CDN for one quality under a single budget.
+  ///
+  /// Each CDN answer is a separate signed request, and the platform advertises
+  /// several. Awaiting them one after another made the room open wait for the
+  /// sum of every line (each of which may itself retry), so one slow CDN held
+  /// back the whole quality selector. The pass now runs a bounded pool and a
+  /// wall clock of its own: whichever lines answered inside the budget become
+  /// the candidates, and the rest stop instead of extending the wait.
+  ///
+  /// The quality grouping is unchanged — a single UI label still never covers a
+  /// mixture of source and downgraded streams, and an unacknowledged rate stays
+  /// unconfirmed rather than being reported as the requested one.
   @override
-  Future<LivePlayUrlResolution> resolvePlayUrlsRaw({
+  Future<LivePlayUrlResolution> resolvePlayUrlsRaw({required LiveRoom liveroom, required LivePlayQuality quality}) =>
+      resolvePlayUrlsRawCancellable(liveroom: liveroom, quality: quality);
+
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsRawCancellable({
     required LiveRoom liveroom,
     required LivePlayQuality quality,
+    CancelToken? cancel,
   }) async {
     final rawData = quality.data;
     final roomId = liveroom.roomId?.trim() ?? '';
     if (rawData is! DouyuPlayData || roomId.isEmpty) return const LivePlayUrlResolution(urls: []);
     final data = rawData;
-    // Each CDN may acknowledge a different rate. A single UI quality label
-    // must not cover a mixture of source and downgraded streams. Prefer an
-    // acknowledged requested rate, otherwise the first acknowledged cohort
-    // in platform order. Unknown acknowledgements remain a separate cohort.
+    final cdns = data.cdns;
+    if (cdns.isEmpty) return const LivePlayUrlResolution(urls: []);
+
+    // One session check for the whole pass. It used to run inside every CDN
+    // request, which multiplied the cheapest step in the chain by the number of
+    // advertised lines.
+    final fetcher = debugPlayDataFetcher;
+    if (fetcher == null) await DouyuUtils.ensureFreshSession();
+
+    final budget = _DouyuResolutionBudget(cancel, debugResolutionBudget ?? resolutionBudget);
     final urlsByRate = <Object?, List<String>>{};
-    Object? lastError;
-    for (final cdn in data.cdns) {
-      try {
-        final resolution = await resolvePlayUrl(roomId, data.rate, cdn);
-        if (resolution.urls.isEmpty) continue;
-        final urls = urlsByRate.putIfAbsent(resolution.appliedQualityData, () => <String>[]);
-        for (final url in resolution.urls) {
-          if (!urls.contains(url)) urls.add(url);
-        }
-      } catch (error) {
-        lastError = error;
+    // Collect per CDN index first. Concurrent answers arrive in completion order,
+    // and appending them as they land would let a fast backup line displace the
+    // room's own CDN at index 0 — the line the room actually streams from, which
+    // the UI commits as the default. Sorting by the advertised index keeps the
+    // platform's order authoritative regardless of which worker finished first.
+    final byCdnIndex = <int, LivePlayUrlResolution>{};
+    final failures = <Object>[];
+    try {
+      final pool = boundedAsyncMap<String, LivePlayUrlResolution>(
+        cdns,
+        maxConcurrent: cdnConcurrency,
+        shouldCancel: () => budget.token.isCancelled,
+        task: (cdn) async {
+          try {
+            // The room's own CDN sits at index 0 and is taken by the first
+            // worker, so the line the room already streams from starts
+            // immediately while one spare worker covers a slow neighbour.
+            final resolution = await resolvePlayUrl(
+              roomId,
+              data.rate,
+              cdn,
+              cancel: budget.token,
+              renewSession: false,
+              fetch: fetcher,
+            );
+            _rememberCdnSuccess(cdn);
+            byCdnIndex[cdns.indexOf(cdn)] = resolution;
+            return resolution;
+          } catch (error) {
+            // The line refused, so it is demoted on the next pass. Cancellation
+            // is not evidence about the line: the viewer left, the edge did not
+            // fail.
+            if (!budget.token.isCancelled) {
+              failures.add(error);
+              _rememberCdnFailure(cdn, DateTime.now());
+            }
+            return null;
+          }
+        },
+      );
+      // Each answer is recorded as it arrives, so the wait itself can be raced
+      // against the budget: a line that neither answers nor honours
+      // cancellation must not keep the room open past its wall clock.
+      await Future.any<void>(<Future<void>>[pool.then((_) {}), budget.stopped]);
+    } finally {
+      budget.close();
+    }
+
+    // A cancelled pass belongs to a room the viewer already left. Handing back
+    // the lines that happened to answer would let the old room commit a source
+    // the caller has stopped waiting for.
+    if (cancel?.isCancelled == true) throw _cancelledError(cancel!);
+
+    for (final index in byCdnIndex.keys.toList()..sort()) {
+      final resolution = byCdnIndex[index]!;
+      if (resolution.urls.isEmpty) continue;
+      final urls = urlsByRate.putIfAbsent(resolution.appliedQualityData, () => <String>[]);
+      for (final url in resolution.urls) {
+        if (!urls.contains(url)) urls.add(url);
       }
     }
+
     if (urlsByRate.isEmpty) {
+      // A line that never answered inside the budget is not the same failure as
+      // every line refusing: report the platform's own answer when one arrived,
+      // otherwise name the stop.
+      final lastError = failures.isEmpty ? null : failures.last;
       if (lastError != null) throw lastError;
-      return const LivePlayUrlResolution(urls: []);
+      throw DouyuPlayApiException('H5 play request ${budget.stopReason ?? 'stopped'} with no line answered');
     }
     final acknowledgedRates = urlsByRate.keys.whereType<int>();
     final appliedRate = urlsByRate.containsKey(data.rate) ? data.rate : acknowledgedRates.firstOrNull;
@@ -333,9 +533,23 @@ class DouyuSite
     return (await resolvePlayUrl(roomId, rate, cdn)).urls.single;
   }
 
-  Future<LivePlayUrlResolution> resolvePlayUrl(String roomId, int rate, String cdn) async {
+  Future<LivePlayUrlResolution> resolvePlayUrl(
+    String roomId,
+    int rate,
+    String cdn, {
+    CancelToken? cancel,
+    bool renewSession = true,
+    Future<Map<String, dynamic>> Function(String roomId, int rate, String cdn, CancelToken? cancel)? fetch,
+  }) async {
     final issuedAt = DateTime.now().toUtc();
-    final playData = await _requestPlayData(roomId, rate: rate, cdn: cdn);
+    final playData = await _requestPlayData(
+      roomId,
+      rate: rate,
+      cdn: cdn,
+      cancel: cancel,
+      renewSession: renewSession,
+      fetch: fetch,
+    );
     final rawRate = playData['rate'];
     // Unlike a bitrate, rate is an opaque integer identifier. Do not truncate
     // malformed fractions (e.g. 0.5) into a false source-quality acknowledgement.
@@ -356,17 +570,36 @@ class DouyuSite
     );
   }
 
-  Future<Map<String, dynamic>> _requestPlayData(String roomId, {int rate = -1, String cdn = ''}) async {
+  Future<Map<String, dynamic>> _requestPlayData(
+    String roomId, {
+    int rate = -1,
+    String cdn = '',
+    CancelToken? cancel,
+    bool renewSession = true,
+    Future<Map<String, dynamic>> Function(String roomId, int rate, String cdn, CancelToken? cancel)? fetch,
+  }) async {
     if (roomId.trim().isEmpty) {
       throw const DouyuPlayApiException('room id is empty');
     }
+
+    final injected = fetch ?? debugPlayDataFetcher;
+    if (injected != null) {
+      if (cancel?.isCancelled == true) throw _cancelledError(cancel!);
+      return injected(roomId, rate, cdn, cancel);
+    }
+
     // A pasted cookie is good for seven days and then stops being a login:
     // renew it here, on the path that actually needs one, instead of failing the
-    // room as a guest because the token aged out.
-    await DouyuUtils.ensureFreshSession();
+    // room as a guest because the token aged out. A caller resolving several
+    // lines in one pass renews once and passes `renewSession: false` so the
+    // pool does not repeat the check per CDN.
+    if (renewSession) await DouyuUtils.ensureFreshSession();
 
     Object? lastError;
     for (var attempt = 0; attempt < 2; attempt++) {
+      // A cancelled line must not start (or restart) a request: the room the
+      // viewer left would otherwise keep fetching signed URLs in the background.
+      if (cancel?.isCancelled == true) throw _cancelledError(cancel!);
       try {
         final sign = await DouyuUtils.sign(roomId, rate: rate, cdn: cdn, forceRefresh: attempt > 0);
         final result = await HttpClient.instance.postJson(
@@ -374,9 +607,11 @@ class DouyuSite
           data: sign,
           formUrlEncoded: true,
           header: DouyuUtils.requestHeaders(roomId),
+          cancel: cancel,
         );
         return parsePlayResponse(result);
       } catch (error) {
+        if (cancel?.isCancelled == true) throw _cancelledError(cancel!);
         lastError = error;
         CoreLog.w(
           'Douyu play request failed (attempt ${attempt + 1}): $error'
@@ -387,12 +622,18 @@ class DouyuSite
         );
         // The first attempt is also the cheapest way to learn the cookie is
         // stale: renew it (the long-term key is the only thing that can) and let
-        // the retry use the fresh one.
-        await DouyuUtils.ensureFreshSession(force: true);
+        // the retry use the fresh one. The whole pass shares one renewal.
+        if (renewSession) await DouyuUtils.ensureFreshSession(force: true);
       }
     }
     throw DouyuPlayApiException('H5 play request failed after retry', cause: lastError);
   }
+
+  static DioException _cancelledError(CancelToken token) => DioException(
+    requestOptions: RequestOptions(path: 'douyu://play-url'),
+    type: DioExceptionType.cancel,
+    error: token.cancelError,
+  );
 
   @visibleForTesting
   static Map<String, dynamic> parsePlayResponse(dynamic response) {
@@ -729,6 +970,59 @@ class DouyuPlayData {
   final List<String> cdns;
 
   DouyuPlayData(this.rate, this.cdns);
+}
+
+/// Cancellation for one CDN resolution pass.
+///
+/// Two sources feed the same token: the caller (a room change or a route
+/// disposal) and the pass's own wall clock. Cancelling here is what stops a
+/// signed request that is still in flight, rather than merely abandoning the
+/// `await` while the socket keeps working.
+class _DouyuResolutionBudget {
+  _DouyuResolutionBudget(CancelToken? caller, Duration budget) {
+    if (caller != null) {
+      if (caller.isCancelled) {
+        _stop('cancelled');
+      } else {
+        unawaited(caller.whenCancel.then((_) => _stop('cancelled')));
+      }
+    }
+    if (!token.isCancelled) {
+      _timer = Timer(budget, () => _stop('timed out'));
+    }
+  }
+
+  final CancelToken token = CancelToken();
+
+  /// Completes when the pass stops early, for racing the wait itself.
+  ///
+  /// Cancelling the token only tells a well-behaved request to give up; it does
+  /// not interrupt one stuck before it can observe the token. Racing the pool
+  /// against this future is what bounds the room open in that case.
+  final Completer<void> _stopped = Completer<void>();
+
+  Future<void> get stopped => _stopped.future;
+
+  Timer? _timer;
+
+  /// Why the pass stopped early, for the error a caller sees when no line
+  /// answered at all.
+  String? stopReason;
+
+  void _stop(String reason) {
+    if (token.isCancelled) return;
+    stopReason = reason;
+    token.cancel(reason);
+    if (!_stopped.isCompleted) _stopped.complete();
+  }
+
+  void close() {
+    _timer?.cancel();
+    _timer = null;
+    // A completed pass must still release the race, or the `Future.any` that
+    // already returned would leave this future pending forever.
+    if (!_stopped.isCompleted) _stopped.complete();
+  }
 }
 
 class DouyuPlayApiException implements Exception {

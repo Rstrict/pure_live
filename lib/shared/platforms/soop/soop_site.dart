@@ -6,6 +6,7 @@ import 'package:pure_live/core/logging/core_log.dart';
 import 'package:pure_live/core/network/http_client.dart';
 import 'package:pure_live/core/models/live_play_quality.dart';
 import 'package:pure_live/shared/platforms/live_site.dart';
+import 'package:pure_live/shared/platforms/live_quality_recovery.dart';
 import 'package:pure_live/shared/platforms/soop/soop_danmaku.dart';
 import 'package:pure_live/shared/platforms/live_danmaku.dart';
 import 'package:pure_live/core/utils/live_quality_label.dart';
@@ -16,7 +17,11 @@ import 'package:pure_live/core/consts/platform_ids.dart';
 import 'package:pure_live/shared/platforms/live_external_room.dart';
 
 class SoopSite extends LiveSite
-    implements LiveSiteRoomRefresher, LiveSiteRecordRoomResolver, LiveSiteExternalRoomResolver {
+    implements
+        LiveSiteRoomRefresher,
+        LiveSiteRecordRoomResolver,
+        LivePlayRecoveryResolver,
+        LiveSiteExternalRoomResolver {
   @override
   RoomExternalTarget? externalRoomTarget(LiveRoom liveroom) {
     final id = sanitizedExternalRoomId(liveroom.roomId);
@@ -292,6 +297,29 @@ class SoopSite extends LiveSite
       _ => 0,
     };
     return rank == 0 ? bitrate : rank * 100000000 + bitrate.clamp(0, 99999999);
+  }
+
+  /// Reacquires the current broadcast and builds a fresh CDN assignment.
+  ///
+  /// [getPlayUrls] reads `bno`/`rmd`/`cdn` out of the room payload; those belong
+  /// to one broadcast session, so replaying the stored quality would regenerate
+  /// an address for a show that already ended. Recovery therefore asks the
+  /// player API for the channel's current broadcast first, then resolves the
+  /// committed quality preset against that session.
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+  }) async {
+    final roomId = liveroom.roomId?.trim() ?? '';
+    if (roomId.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    final fresh = await _resolveDetail(roomId);
+    final qualities = await getPlayQualites(liveroom: fresh);
+    final recovered = matchRecoveredQuality(qualities, requestedSelectionId: quality.selectionId);
+    if (recovered == null) return const LivePlayUrlResolution(urls: <String>[]);
+    final urls = await getPlayUrls(liveroom: fresh, quality: recovered);
+    if (urls.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    return LivePlayUrlResolution(urls: urls, appliedQualityData: recovered.selectionId);
   }
 
   @override

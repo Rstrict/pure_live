@@ -35,6 +35,12 @@ class PlaybackSourceTransport {
   final Set<PlaybackInputLease> _pending = {};
   final Set<PlaybackInputLease> _retiring = {};
 
+  /// Manifest probes still running for a transaction of this owner.
+  ///
+  /// Kept so a superseded transaction or a disposal closes the playlist read
+  /// instead of leaving it to its own deadline.
+  final Set<CancelToken> _probing = {};
+
   /// Inputs already superseded but kept open one round: the engine may still be
   /// reading the loopback URI while the caller assembles its replacement source
   /// list, so they are retired by the *next* transaction instead of immediately.
@@ -148,6 +154,11 @@ class PlaybackSourceTransport {
     final int generation = ++_generation;
     bool current() => !_closed && generation == _generation;
     PlaybackInputLease? input;
+    // The manifest probe is a network read that belongs to this transaction. A
+    // superseded transaction must stop it, or a room the viewer already left
+    // keeps its playlist request open until the probe's own deadline.
+    final CancelToken probeCancel = CancelToken();
+    _probing.add(probeCancel);
     try {
       if (_creating.isNotEmpty || _pending.isNotEmpty || _stale.isNotEmpty) await _cancelPendingResources();
       if (!current()) return null;
@@ -156,7 +167,11 @@ class PlaybackSourceTransport {
         headers: headers,
         facts: facts,
         policy: policy,
+        cancel: probeCancel,
       );
+      // The decision is made; nothing in this transaction reads the playlist now.
+      _probing.remove(probeCancel);
+      if (!probeCancel.isCancelled) probeCancel.cancel('input chosen');
       // The superseded input stays open one more round: the engine may still be
       // reading it while the caller assembles the replacement source list.
       final PlaybackInputLease? previous = _active;
@@ -169,6 +184,8 @@ class PlaybackSourceTransport {
       _pending.remove(input);
       return _active;
     } catch (error) {
+      _probing.remove(probeCancel);
+      if (!probeCancel.isCancelled) probeCancel.cancel('prepare failed');
       if (input != null) {
         _pending.remove(input);
         await _retire(input);
@@ -196,6 +213,7 @@ class PlaybackSourceTransport {
     required Map<String, String> headers,
     required LiveStreamFacts? facts,
     required HlsSourceQueryPolicy? policy,
+    CancelToken? cancel,
   }) async {
     final Uri? source = Uri.tryParse(url);
     if (source == null) return null;
@@ -224,6 +242,7 @@ class PlaybackSourceTransport {
       headers: frozen,
       facts: facts,
       manifest: manifest,
+      cancel: cancel,
     );
     final IngestPlan plan = resolveIngestPlan(needs: decision.needs, sourceIsManifest: manifest);
     if (plan.isDirect) return null;
@@ -251,6 +270,7 @@ class PlaybackSourceTransport {
     required Map<String, String> headers,
     required LiveStreamFacts? facts,
     required bool manifest,
+    CancelToken? cancel,
   }) async {
     // A platform that declares its line is believed: that is the point of the
     // declaration, and it saves a probe read on every HLS start.
@@ -261,7 +281,7 @@ class PlaybackSourceTransport {
       // cannot be handed to the native resolver, because a reader that loses the
       // manifest URL looks for them next to itself and turns them into local
       // paths (`No protocol handler found ... \tc.livehls\...\media.95.mp4`).
-      final PlaybackManifestProbe? probe = await probePlaybackManifest(url, headers: headers);
+      final PlaybackManifestProbe? probe = await probePlaybackManifest(url, headers: headers, cancel: cancel);
       if (probe != null) {
         final Set<IngestNeed> needs = probe.kind.requiresRewrite
             ? const <IngestNeed>{IngestNeed.relativeChildren}
@@ -372,6 +392,12 @@ class PlaybackSourceTransport {
     for (final creation in creating) {
       creation.cancel.cancel();
     }
+    // A manifest probe belongs to the transaction that started it; superseding
+    // that transaction must stop the read, not leave it to its own deadline.
+    for (final probe in _probing.toList()) {
+      if (!probe.isCancelled) probe.cancel('playback transaction superseded');
+    }
+    _probing.clear();
     final pending = _pending.toList();
     _pending.clear();
     final stale = _stale.toList();

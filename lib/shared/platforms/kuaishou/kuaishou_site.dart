@@ -10,6 +10,7 @@ import 'package:pure_live/core/network/fake_user_agent.dart';
 import 'package:pure_live/core/network/http_client.dart';
 import 'package:pure_live/core/models/live_play_quality.dart';
 import 'package:pure_live/shared/platforms/live_site.dart';
+import 'package:pure_live/shared/platforms/live_quality_recovery.dart';
 import 'package:pure_live/shared/platforms/kuaishou/kuaishou_danmaku.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:pure_live/shared/platforms/live_danmaku.dart';
@@ -20,7 +21,12 @@ import 'package:pure_live/core/consts/platform_ids.dart';
 import 'package:pure_live/shared/platforms/live_external_room.dart';
 
 class KuaishouSite
-    implements LiveSite, LiveSiteRoomRefresher, LiveSiteRecordRoomResolver, LiveSiteExternalRoomResolver {
+    implements
+        LiveSite,
+        LiveSiteRoomRefresher,
+        LiveSiteRecordRoomResolver,
+        LivePlayRecoveryResolver,
+        LiveSiteExternalRoomResolver {
   @override
   RoomExternalTarget? externalRoomTarget(LiveRoom liveroom) {
     final id = sanitizedExternalRoomId(liveroom.roomId);
@@ -300,6 +306,32 @@ class KuaishouSite
     return const <String>[];
   }
 
+  /// Reacquires the room page with its playback data and re-selects the quality.
+  ///
+  /// Kuaishou hands the playable descriptors to the room payload; [getPlayUrls]
+  /// merely replays the URL list stored in the quality object. Recovery must
+  /// therefore refresh the room, and it asks for a fresh session rather than the
+  /// cheap anonymous card read: the signed addresses are what expired. The
+  /// requested quality is matched by its stable id, and a replay/recommendation
+  /// card is not accepted as a substitute for the live room the viewer was
+  /// watching.
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+  }) async {
+    final roomId = liveroom.roomId?.trim() ?? '';
+    if (roomId.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    final fresh = await _loadRoom(roomId, includePlaybackData: true, ensureSession: true);
+    final qualities = parsePlayQualities(fresh.data);
+    final recovered = matchRecoveredQuality(qualities, requestedSelectionId: quality.selectionId);
+    if (recovered == null) return const LivePlayUrlResolution(urls: <String>[]);
+    return LivePlayUrlResolution(
+      urls: await getPlayUrls(liveroom: fresh, quality: recovered),
+      appliedQualityData: recovered.selectionId,
+    );
+  }
+
   @override
   Future<List<LiveRoom>> getRecommendRooms({int page = 1, int pageSize = 30}) async {
     try {
@@ -500,8 +532,7 @@ class KuaishouSite
   }
 
   static Map<String, String> _emojiTable(Map<String, dynamic> state) {
-    Map<dynamic, dynamic> fields(Object? value) =>
-        value is Map ? value : const <dynamic, dynamic>{};
+    Map<dynamic, dynamic> fields(Object? value) => value is Map ? value : const <dynamic, dynamic>{};
     final pcConfig = fields(state['pcConfig']);
     final inner = fields(pcConfig['pcConfig']);
     final config = fields(inner['config']);
@@ -555,11 +586,7 @@ class KuaishouSite
       link: liveStreamId,
       danmakuData: liveStreamId.isEmpty
           ? null
-          : KuaishouDanmakuArgs(
-              liveStreamId: liveStreamId,
-              cookie: _effectiveCookie,
-              emotes: _emojiTable(jsonObj),
-            ),
+          : KuaishouDanmakuArgs(liveStreamId: liveStreamId, cookie: _effectiveCookie, emotes: _emojiTable(jsonObj)),
       data: includePlaybackData ? liveStream["playUrls"] : null,
     );
   }

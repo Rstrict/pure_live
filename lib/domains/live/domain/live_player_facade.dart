@@ -61,6 +61,55 @@ final class LivePlayerFacade {
 
   PlaybackSourceResolver? _sourceResolver;
 
+  /// When the current signed source must be replaced, and the timer that will
+  /// do it.
+  ///
+  /// A Douyu FLV keeps its `expire=300` lease: the CDN closes the connection
+  /// 300 s after the URL was issued, which a measured 6-minute read shows as a
+  /// clean EOF at exactly +300 s, and appending `&expire=0` does not extend it
+  /// (the server also answers 403 when the field is rewritten). Nothing in this
+  /// app acted on that deadline before: the value was threaded through
+  /// `play(...)`/`playSource(...)` and dropped, so playback simply stopped at
+  /// the fifth minute and only a user-visible retry recovered it.
+  ///
+  /// The timer therefore re-resolves the source through the same recovery
+  /// resolver the stall path uses — a real platform round trip, not a reuse of
+  /// the old signature — and re-opens the native source on the fresh URL while
+  /// the player still has buffered media in hand.
+  DateTime? _sourceRefreshAt;
+  Timer? _sourceLeaseTimer;
+
+  /// When the currently playing source must be replaced, as the platform
+  /// declared it. `null` when the source carries no lease (or renewal failed).
+  ///
+  /// Exposed for the lease tests: the value that used to be accepted and thrown
+  /// away is now the one the renewal timer is scheduled from.
+  @visibleForTesting
+  DateTime? get sourceRefreshAt => _sourceRefreshAt;
+
+  /// How early to renew before the lease actually closes.
+  ///
+  /// The resolver round trip is a few hundred milliseconds on this network, and
+  /// the buffer covers the reopen, but an Android device can be slow enough that
+  /// a last-second renew is itself the stall. A tenth of the lease, capped at
+  /// 45 s, keeps the margin proportional on short leases (a 60 s token renews at
+  /// 6 s) and bounded on long ones.
+  static const Duration _leaseRenewCap = Duration(seconds: 45);
+
+  /// How long to wait before renewing a lease that closes at [refreshAt].
+  ///
+  /// Pure arithmetic, exposed so the schedule is testable without an engine:
+  /// a tenth of the remaining lease is held back as margin, capped at
+  /// [_leaseRenewCap] so a long token is not renewed almost a minute early and a
+  /// short one still keeps a usable margin.
+  @visibleForTesting
+  static Duration leaseRenewDelay({required DateTime refreshAt, required DateTime now}) {
+    final budget = refreshAt.toUtc().difference(now.toUtc());
+    if (budget <= Duration.zero) return Duration.zero;
+    final margin = budget ~/ 10;
+    return budget - (margin < _leaseRenewCap ? margin : _leaseRenewCap);
+  }
+
   static PlayerKernel get kernel => PlayerKernelService.instance.kernel;
 
   late final LivePlaybackController _controller;
@@ -204,6 +253,7 @@ final class LivePlayerFacade {
       streamFacts: streamFacts,
     );
     if (liveroom != null) await setVolume(_openVolumeFor(liveroom));
+    _armLeaseTimer(sourceRefreshAt);
   }
 
   Future<void> playOwned(
@@ -493,6 +543,107 @@ final class LivePlayerFacade {
     return refreshed.sources;
   }
 
+  void _cancelLeaseTimer() {
+    _sourceLeaseTimer?.cancel();
+    _sourceLeaseTimer = null;
+    _sourceRefreshAt = null;
+  }
+
+  /// Schedules the renewal of a signed source before its lease closes.
+  ///
+  /// Called by every entry point that opens a remote source. `null` means the
+  /// platform gave no deadline (most platforms, and every local/owned input), in
+  /// which case the timer stays off and nothing changes for them.
+  void _armLeaseTimer(DateTime? refreshAt) {
+    _cancelLeaseTimer();
+    if (refreshAt == null || _disposed) return;
+    _sourceRefreshAt = refreshAt;
+    final delay = leaseRenewDelay(refreshAt: refreshAt, now: DateTime.now());
+    if (delay <= Duration.zero) {
+      // Already past the renewal point: renew on the next turn of the event
+      // loop so the open that just completed is not preempted by its own
+      // renewal, and so a caller cannot deadlock awaiting `play`.
+      _sourceLeaseTimer = Timer(Duration.zero, () => unawaited(_renewLeasedSource()));
+      return;
+    }
+    _sourceLeaseTimer = Timer(delay, () => unawaited(_renewLeasedSource()));
+  }
+
+  /// Re-resolves the playing line and re-opens it before the CDN closes it.
+  ///
+  /// The resolver is the same recovery port the stall path uses, so this is a
+  /// real platform request with a fresh signature rather than a replay of the
+  /// expiring URL. A renewal that fails or comes back with nothing leaves the
+  /// current connection alone: the stall watchdog is still armed behind it, so a
+  /// failed renewal degrades to the behaviour this app had before, not to a
+  /// stopped stream.
+  Future<void> _renewLeasedSource() async {
+    _sourceLeaseTimer = null;
+    if (_disposed) return;
+    final resolver = _sourceResolver;
+    final committed = commit;
+    final room = _room;
+    if (resolver == null || committed == null || room == null) return;
+
+    final fenceRevision = _commitRevision;
+    final PlaybackSourceRefreshResult result;
+    try {
+      result = await resolver(sourceRefreshRequestFor(committed));
+    } catch (error) {
+      MediaCoreLog.warning(
+        LogCategory.recovery,
+        'lease renewal failed; keeping the current connection',
+        error: error,
+      );
+      return;
+    }
+    if (!canAdoptSourceRefresh(
+      disposed: _disposed,
+      sameRoom: identical(_room, room),
+      revisionMoved: _commitRevision != fenceRevision,
+      result: result,
+    )) {
+      return;
+    }
+
+    final refreshed = await refreshedPlaybackCommit(
+      result,
+      committed: committed,
+      room: room,
+      intercept: (sources) => _intercept(
+        sources,
+        streamFacts: result.selection?.streamFacts ?? const {},
+        sourceQueryPolicies: result.selection?.sourceQueryPolicies ?? const {},
+      ),
+    );
+    if (refreshed.sources.isEmpty || _disposed) return;
+
+    _lastLines = refreshed.lines;
+    _publishCommit(
+      refreshed.currentUrl,
+      refreshed.urls,
+      refreshed.qualities,
+      refreshed.currentQuality,
+      streamFacts: refreshed.streamFacts,
+      source: refreshed.ownedSource,
+    );
+    // Re-open the source list itself, not `retry()`: the controller opens the
+    // sources it was given, so a retry after a lease renewal would reopen the
+    // *old* expiring signature. Handing it the refreshed plan is what actually
+    // replaces the URL. `play` also supersedes any queued recovery and bumps
+    // the play generation, which is the transition a renewal needs.
+    await _controller.play(
+      LiveSourceRequest(sources: refreshed.sources, title: room.title),
+      preferredBackend: backendIdOfEngine(preferredEngine),
+    );
+    final next = result.refreshAt;
+    if (next != null) {
+      _armLeaseTimer(next);
+    } else {
+      _cancelLeaseTimer();
+    }
+  }
+
   final RxBool isInPip = false.obs;
   final RxBool isPipPreparing = false.obs;
   final RxInt videoPresentationRevision = 0.obs;
@@ -757,6 +908,7 @@ final class LivePlayerFacade {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    _cancelLeaseTimer();
     await _sourceInterceptor?.close();
     await _stateSub?.cancel();
     await _playingSub?.cancel();

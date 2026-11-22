@@ -119,8 +119,8 @@ List<LivePlayQuality> _qualityChoicesWithConfirmation(
 @visibleForTesting
 String streamMetadataFailureKey({required Object error, required bool appProxyEnabled}) =>
     isUnreachableSiteFailure(error)
-        ? (appProxyEnabled ? 'site_unreachable_via_proxy' : 'site_unreachable')
-        : 'read_video_failed';
+    ? (appProxyEnabled ? 'site_unreachable_via_proxy' : 'site_unreachable')
+    : 'read_video_failed';
 @visibleForTesting
 List<LivePlayQuality> normalizePlayQualities(Iterable<LivePlayQuality> qualities) {
   final unique = <LivePlayQuality>[];
@@ -197,6 +197,7 @@ class PlayerController extends GetxController {
   int _loadEpoch = 0;
   bool _closed = false;
   CancelToken? _qualityCancel;
+  CancelToken? _playUrlCancel;
   final Set<Future<void>> _qualityRequests = {};
   int _streamSelectionEpoch = 0;
   int _lastSourceCommitRevision = 0;
@@ -284,6 +285,8 @@ class PlayerController extends GetxController {
     _loadEpoch++;
     _qualityCancel?.cancel();
     _qualityCancel = null;
+    _playUrlCancel?.cancel();
+    _playUrlCancel = null;
   }
 
   bool _isLoadCurrent(int epoch, LiveRoom liveroom, Site site) {
@@ -632,10 +635,9 @@ class PlayerController extends GetxController {
         name: 'PlayerController',
         stackTrace: stackTrace,
       );
-      ToastUtil.show(i18n(streamMetadataFailureKey(
-        error: error,
-        appProxyEnabled: SettingsService.to.proxy.enableAppProxy.v,
-      )));
+      ToastUtil.show(
+        i18n(streamMetadataFailureKey(error: error, appProxyEnabled: SettingsService.to.proxy.enableAppProxy.v)),
+      );
       _main.updateRoom(success: false);
     }
   }
@@ -672,10 +674,27 @@ class PlayerController extends GetxController {
     final playerState = _state.player;
     if (playerState.qualites.isEmpty || playerState.currentQuality >= playerState.qualites.length) return;
 
-    final resolution = await site.liveSite.resolvePlayUrls(
-      liveroom: liveroom,
-      quality: playerState.qualites[playerState.currentQuality],
-    );
+    // The room's multi-line resolution has its own cancellation source so a
+    // room the viewer already left stops signing CDN requests. It is not the
+    // quality-discovery token: that one is cancelled by the next discovery pass,
+    // which would abort a resolution that is still the current one.
+    final cancel = CancelToken();
+    _playUrlCancel = cancel;
+    final LivePlayUrlResolution resolution;
+    try {
+      resolution = await site.liveSite.resolvePlayUrlsCancellable(
+        liveroom: liveroom,
+        quality: playerState.qualites[playerState.currentQuality],
+        cancel: cancel,
+      );
+    } catch (_) {
+      // A cancelled resolution belongs to a room that is no longer current; its
+      // failure must not be shown against the room the viewer switched to.
+      if (cancel.isCancelled || !_isLoadCurrent(loadEpoch, liveroom, site)) return;
+      rethrow;
+    } finally {
+      if (identical(_playUrlCancel, cancel)) _playUrlCancel = null;
+    }
     if (!_isLoadCurrent(loadEpoch, liveroom, site)) return;
 
     if (!resolution.hasSources) {
@@ -744,13 +763,26 @@ class PlayerController extends GetxController {
     final sourceCommitBeforeSelection = _lastSourceCommitRevision;
     isStreamSwitching.value = true;
 
+    // Latest-wins: a second tap supersedes this one, and the superseded pass
+    // must stop signing CDN requests instead of finishing in the background.
+    final cancel = CancelToken();
+    _playUrlCancel = cancel;
+
     try {
       final requestedQualityValue = before.qualites[requestedQuality];
       final refreshSignedSource = site.liveSite is LivePlayRecoveryResolver;
       final resolution = refreshSignedSource
-          ? await site.liveSite.resolvePlayUrlsForRecovery(liveroom: room, quality: requestedQualityValue)
+          ? await site.liveSite.resolvePlayUrlsForRecoveryCancellable(
+              liveroom: room,
+              quality: requestedQualityValue,
+              cancel: cancel,
+            )
           : type == ReloadDataType.changeQuality || before.ownedSource != null
-          ? await site.liveSite.resolvePlayUrls(liveroom: room, quality: requestedQualityValue)
+          ? await site.liveSite.resolvePlayUrlsCancellable(
+              liveroom: room,
+              quality: requestedQualityValue,
+              cancel: cancel,
+            )
           : LivePlayUrlResolution.withSourcePolicies(
               urls: List<String>.from(before.playUrls),
               sourceQueryPolicies: before.sourceQueryPolicies,
@@ -871,21 +903,21 @@ class PlayerController extends GetxController {
             hasUseDefaultResolution: before.hasUseDefaultResolution,
           );
         }
-        if (error is! _StreamSelectionCancelled) {
+        if (error is! _StreamSelectionCancelled && !cancel.isCancelled) {
           developer.log(
             'Stream selection failed (${error.runtimeType})',
             name: 'PlayerController',
             error: error,
             stackTrace: stackTrace,
           );
-          ToastUtil.show(i18n(streamMetadataFailureKey(
-            error: error,
-            appProxyEnabled: SettingsService.to.proxy.enableAppProxy.v,
-          )));
+          ToastUtil.show(
+            i18n(streamMetadataFailureKey(error: error, appProxyEnabled: SettingsService.to.proxy.enableAppProxy.v)),
+          );
         }
       }
       return false;
     } finally {
+      if (identical(_playUrlCancel, cancel)) _playUrlCancel = null;
       if (selectionEpoch == _streamSelectionEpoch) isStreamSwitching.value = false;
     }
   }

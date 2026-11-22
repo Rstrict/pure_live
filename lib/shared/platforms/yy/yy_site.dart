@@ -8,6 +8,7 @@ import 'package:pure_live/shared/platforms/yy/yy_danmaku.dart';
 import 'package:pure_live/core/network/http_client.dart';
 import 'package:pure_live/core/models/live_play_quality.dart';
 import 'package:pure_live/shared/platforms/live_site.dart';
+import 'package:pure_live/shared/platforms/live_quality_recovery.dart';
 import 'package:pure_live/shared/platforms/live_danmaku.dart';
 import 'package:pure_live/core/utils/live_quality_label.dart';
 import 'package:pure_live/shared/platforms/current_live_room.dart';
@@ -15,7 +16,13 @@ import 'package:pure_live/core/config/cookie_settings_controller.dart';
 import 'package:pure_live/core/consts/platform_ids.dart';
 import 'package:pure_live/shared/platforms/live_external_room.dart';
 
-class YYSite implements LiveSite, LiveSiteRoomRefresher, LiveSiteRecordRoomResolver, LiveSiteExternalRoomResolver {
+class YYSite
+    implements
+        LiveSite,
+        LiveSiteRoomRefresher,
+        LiveSiteRecordRoomResolver,
+        LivePlayRecoveryResolver,
+        LiveSiteExternalRoomResolver {
   @override
   RoomExternalTarget? externalRoomTarget(LiveRoom liveroom) {
     final id = sanitizedExternalRoomId(liveroom.roomId);
@@ -502,6 +509,52 @@ class YYSite implements LiveSite, LiveSiteRoomRefresher, LiveSiteRecordRoomResol
 
   /// ============================================================
   /// ============================================================
+
+  /// Reacquires the stream manager answer and rebuilds the address list.
+  ///
+  /// YY's two routes have separate identities: the StreamManager gear is a
+  /// numeric code while the mobile HLS source carries a `mobile-hls:` prefix,
+  /// and only the mobile route survives the channels whose StreamManager
+  /// answers `ErrAuthNotPass`. Recovery therefore keeps the committed route
+  /// rather than falling through to the other one: a viewer moved onto a
+  /// different protocol would also be moved onto a different quality label
+  /// without being told.
+  ///
+  /// The StreamManager answer carries both the address list and the gear table,
+  /// so one request settles "is this gear still served?" without a second
+  /// round trip.
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+  }) async {
+    if ((liveroom.roomId?.trim() ?? '').isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    final requested = quality.data?.toString() ?? '';
+    if (requested.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+
+    if (requested.startsWith(_mobileHlsPrefix)) {
+      final rate = requested.substring(_mobileHlsPrefix.length);
+      final payload = await _getMobileHlsStream(liveroom: liveroom, rate: rate);
+      final url = payload?['hls']?.toString().trim() ?? '';
+      return url.isEmpty
+          ? const LivePlayUrlResolution(urls: <String>[])
+          : LivePlayUrlResolution(urls: <String>[url], appliedQualityData: requested);
+    }
+
+    final payload = await getLiveStreamObj(liveroom: liveroom, qn: requested);
+    final urls = parsePlayUrls(payload);
+    if (urls.isNotEmpty) return LivePlayUrlResolution(urls: urls, appliedQualityData: quality.selectionId);
+
+    // The committed gear returned no address. It is only retried through a
+    // different gear when the platform still advertises the committed one, so
+    // "the address expired" and "that quality is gone" stay distinguishable.
+    final recovered = matchRecoveredQuality(parsePlayQualities(payload), requestedSelectionId: quality.selectionId);
+    if (recovered == null) return const LivePlayUrlResolution(urls: <String>[]);
+    return LivePlayUrlResolution(
+      urls: parsePlayUrls(await getLiveStreamObj(liveroom: liveroom, qn: recovered.data.toString())),
+      appliedQualityData: recovered.selectionId,
+    );
+  }
 
   @override
   Future<List<String>> getPlayUrls({required LiveRoom liveroom, required LivePlayQuality quality}) async {

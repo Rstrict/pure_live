@@ -8,6 +8,7 @@ import 'package:pure_live/core/models/live_anchor_item.dart';
 import 'package:pure_live/core/network/http_client.dart';
 import 'package:pure_live/core/models/live_play_quality.dart';
 import 'package:pure_live/shared/platforms/live_site.dart';
+import 'package:pure_live/shared/platforms/live_quality_recovery.dart';
 import 'package:pure_live/core/utils/type_cast.dart';
 import 'package:pure_live/shared/platforms/douyin/douyin_danmaku.dart';
 import 'package:pure_live/shared/platforms/douyin/douyin_audience.dart';
@@ -24,7 +25,7 @@ import 'package:pure_live/shared/platforms/live_external_room.dart';
 
 class DouyinSite
     with LiveDanmakuCapabilityDefaults, DouyinDanmakuCapability
-    implements LiveSite, LiveSiteRecordRoomResolver, LiveSiteExternalRoomResolver {
+    implements LiveSite, LiveSiteRecordRoomResolver, LivePlayRecoveryResolver, LiveSiteExternalRoomResolver {
   @override
   RoomExternalTarget? externalRoomTarget(LiveRoom liveroom) {
     final id = sanitizedExternalRoomId(liveroom.roomId);
@@ -516,11 +517,7 @@ class DouyinSite
     final gameData = room is Map ? room['game_data'] : null;
     final gameTagInfo = gameData is Map ? gameData['game_tag_info'] : null;
     final gameName = gameTagInfo is Map ? gameTagInfo['game_tag_name']?.toString().trim() : null;
-    for (final candidate in [
-      gameName,
-      title(roadMap is Map ? roadMap['sub_partition'] : null),
-      title(roadMap),
-    ]) {
+    for (final candidate in [gameName, title(roadMap is Map ? roadMap['sub_partition'] : null), title(roadMap)]) {
       if (candidate != null && candidate.isNotEmpty) return candidate;
     }
     return '';
@@ -930,6 +927,31 @@ class DouyinSite
   Future<List<String>> getPlayUrls({required LiveRoom liveroom, required LivePlayQuality quality}) async {
     final data = quality.data;
     return data is List ? data.map((url) => url.toString()).where((url) => url.isNotEmpty).toList(growable: false) : [];
+  }
+
+  /// Reacquires the live room so the signed `stream_data` envelope is current.
+  ///
+  /// Douyin puts the playable URLs inside the room's `live_core_sdk_data`, and
+  /// [getPlayUrls] only reads them back out of the quality object it was handed.
+  /// Recovery therefore has to fetch the room again: re-reading the old quality
+  /// would hand the engine the same expired addresses. The requested `sdk_key`
+  /// is matched on the fresh table; when the platform no longer advertises it,
+  /// the room is reported as having no source rather than silently downgraded.
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+  }) async {
+    final roomId = liveroom.roomId?.trim() ?? '';
+    if (roomId.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    final fresh = await _resolveDetail(roomId);
+    final qualities = parseStreamQualities(fresh.data);
+    final recovered = matchRecoveredQuality(qualities, requestedSelectionId: quality.selectionId);
+    if (recovered == null) return const LivePlayUrlResolution(urls: <String>[]);
+    return LivePlayUrlResolution(
+      urls: await getPlayUrls(liveroom: fresh, quality: recovered),
+      appliedQualityData: recovered.selectionId,
+    );
   }
 
   @override

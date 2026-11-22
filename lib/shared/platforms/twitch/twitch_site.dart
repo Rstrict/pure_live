@@ -9,6 +9,7 @@ import 'package:pure_live/core/network/android_native_http.dart';
 import 'package:pure_live/core/network/http_client.dart';
 import 'package:pure_live/core/models/live_play_quality.dart';
 import 'package:pure_live/shared/platforms/live_site.dart';
+import 'package:pure_live/shared/platforms/live_quality_recovery.dart';
 import 'package:pure_live/shared/platforms/twitch/twitch_danmaku.dart';
 import 'package:pure_live/shared/platforms/live_danmaku.dart';
 import 'package:pure_live/shared/platforms/twitch/twitch_models.dart';
@@ -18,7 +19,13 @@ import 'package:pure_live/core/config/cookie_settings_controller.dart';
 import 'package:pure_live/core/consts/platform_ids.dart';
 import 'package:pure_live/shared/platforms/live_external_room.dart';
 
-class TwitchSite implements LiveSite, LiveSiteRoomRefresher, LiveSiteRecordRoomResolver, LiveSiteExternalRoomResolver {
+class TwitchSite
+    implements
+        LiveSite,
+        LiveSiteRoomRefresher,
+        LiveSiteRecordRoomResolver,
+        LivePlayRecoveryResolver,
+        LiveSiteExternalRoomResolver {
   @override
   RoomExternalTarget? externalRoomTarget(LiveRoom liveroom) {
     final id = sanitizedExternalRoomId(liveroom.roomId);
@@ -683,6 +690,33 @@ class TwitchSite implements LiveSite, LiveSiteRoomRefresher, LiveSiteRecordRoomR
     return '自动';
   }
 
+  /// Reacquires the playback token and rebuilds the variant list from a fresh
+  /// master playlist.
+  ///
+  /// A Twitch media URL is only valid for the `PlaybackAccessToken` signature
+  /// embedded in its query, so replaying the quality's stored URL list just
+  /// reopens the expired address. Recovery therefore repeats the whole chain —
+  /// GQL token, then master playlist — and re-selects the committed variant by
+  /// the same `height:framerate:bandwidth:videoGroup` key the first resolve used.
+  ///
+  /// A variant the channel stopped serving means the requested tier is gone;
+  /// returning another one would silently change what the viewer sees, and an
+  /// unannounced substitution is not what a refresh is allowed to do.
+  @override
+  Future<LivePlayUrlResolution> resolvePlayUrlsForRecoveryRaw({
+    required LiveRoom liveroom,
+    required LivePlayQuality quality,
+  }) async {
+    final channel = liveroom.roomId?.trim() ?? '';
+    if (channel.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    final qualities = await getPlayQualites(liveroom: liveroom);
+    final recovered = matchRecoveredQuality(qualities, requestedSelectionId: quality.selectionId);
+    if (recovered == null) return const LivePlayUrlResolution(urls: <String>[]);
+    final urls = await getPlayUrls(liveroom: liveroom, quality: recovered);
+    if (urls.isEmpty) return const LivePlayUrlResolution(urls: <String>[]);
+    return LivePlayUrlResolution(urls: urls, appliedQualityData: recovered.selectionId);
+  }
+
   @override
   Future<List<String>> getPlayUrls({required LiveRoom liveroom, required LivePlayQuality quality}) async {
     final data = quality.data;
@@ -854,9 +888,9 @@ class TwitchSite implements LiveSite, LiveSiteRoomRefresher, LiveSiteRecordRoomR
         var subItem = LiveRoom(
           roomId: login,
           title: node["title"]?.toString() ?? '',
-          cover: (node["previewImageURL"] ?? "")
-              .toString()
-              .appendTxt("?&t=${DateTime.now().millisecondsSinceEpoch ~/ 1000}"),
+          cover: (node["previewImageURL"] ?? "").toString().appendTxt(
+            "?&t=${DateTime.now().millisecondsSinceEpoch ~/ 1000}",
+          ),
           nick: broadcaster["displayName"]?.toString() ?? login,
           avatar: (broadcaster["profileImageURL"] ?? "").toString(),
           watching: (node["viewersCount"] ?? 0).toString(),
@@ -914,9 +948,9 @@ class TwitchSite implements LiveSite, LiveSiteRoomRefresher, LiveSiteRecordRoomR
       var subItem = LiveRoom(
         roomId: node["login"],
         title: node["broadcastSettings"]["title"],
-        cover: (node["stream"]?["previewImageURL"] ?? "")
-            .toString()
-            .appendTxt("?&t=${DateTime.now().millisecondsSinceEpoch ~/ 1000}"),
+        cover: (node["stream"]?["previewImageURL"] ?? "").toString().appendTxt(
+          "?&t=${DateTime.now().millisecondsSinceEpoch ~/ 1000}",
+        ),
         nick: node["displayName"],
         followers: node["followers"]?["totalCount"]?.toString() ?? '',
         avatar: node["profileImageURL"].toString(),
