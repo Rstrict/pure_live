@@ -63,8 +63,13 @@ dependencies:
   flame_barrage: ^0.0.9
 
   # Keep this exact: 0.6.2 preserves argv through FFmpeg/FFprobe/FFplay.
-  # Platform URL overrides below select our verified FFmpeg 9.0.2 bundles;
-  # prefetch gates pin the Android and Windows archive hashes.
+  #
+  # The 0.6.2 Native Assets hook downloads its own prebuilt bundles and verifies
+  # them against the digest it reads from the upstream GitHub release. It has no
+  # URL override: `ffmpeg_kit_extended_config` below is read for `type`/`gpl`/
+  # `small` only. Pointing the prefetch cache at different bytes therefore fails
+  # the hook's own check, which is why tool/prefetch_android_native.ps1 pins the
+  # upstream archives it will actually accept.
   ffmpeg_kit_extended_flutter: 0.6.2
   bonsoir: ^7.1.5 # LAN device discovery for settings sync
 

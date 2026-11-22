@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
@@ -332,13 +332,34 @@ foreach ($marker in @(
     }
 }
 
-$fplayerPluginBuildPath = Join-Path $repoRoot 'plugins\flv_lzc\android\build.gradle'
+# The `flv_lzc` plugin is a git dependency (see pubspec.lock), so it resolves into
+# the Pub cache rather than a repository-local `plugins/` directory. Read the
+# resolved location from package_config.json instead of assuming a checkout
+# layout: the 16 KB fplayer AAR and its Maven wiring live with the package, and a
+# hard-coded path here silently rots whenever the dependency moves.
+$fplayerPackageConfigPath = Join-Path $repoRoot '.dart_tool\package_config.json'
+if (-not (Test-Path -LiteralPath $fplayerPackageConfigPath -PathType Leaf)) {
+    throw 'package_config.json is required to locate the flv_lzc plugin.'
+}
+$fplayerPackageConfig = Get-Content -LiteralPath $fplayerPackageConfigPath -Raw | ConvertFrom-Json
+$fplayerPackage = @($fplayerPackageConfig.packages | Where-Object { $_.name -eq 'flv_lzc' })
+if ($fplayerPackage.Count -ne 1) {
+    throw "Expected exactly one resolved flv_lzc package, found $($fplayerPackage.Count)."
+}
+# rootUri is relative to package_config.json for path dependencies and absolute
+# for hosted/git ones, so it has to be resolved against the config file's own URI.
+$fplayerRootUri = [Uri]::new([Uri]::new($fplayerPackageConfigPath), [string]$fplayerPackage[0].rootUri)
+$fplayerPluginRoot = $fplayerRootUri.LocalPath
+$fplayerPluginBuildPath = Join-Path $fplayerPluginRoot 'android\build.gradle'
+if (-not (Test-Path -LiteralPath $fplayerPluginBuildPath -PathType Leaf)) {
+    throw "flv_lzc android/build.gradle is missing at $fplayerPluginBuildPath"
+}
 $fplayerPluginBuild = Get-Content -LiteralPath $fplayerPluginBuildPath -Raw
 $androidRootBuild = Get-Content -LiteralPath (Join-Path $repoRoot 'android\build.gradle.kts') -Raw
 $fplayerCoreVersion = '1.0.4-purelive16k'
 $fplayerCoreRelativePath =
-    "plugins\flv_lzc\android\libs\io\github\flutterplayer\fplayer-core\$fplayerCoreVersion\fplayer-core-$fplayerCoreVersion.aar"
-$fplayerCorePath = Join-Path $repoRoot $fplayerCoreRelativePath
+    "android\libs\io\github\flutterplayer\fplayer-core\$fplayerCoreVersion\fplayer-core-$fplayerCoreVersion.aar"
+$fplayerCorePath = Join-Path $fplayerPluginRoot $fplayerCoreRelativePath
 foreach ($marker in @(
     'url = uri("$projectDir/libs")',
     'includeModule("io.github.flutterplayer", "fplayer-core")',
@@ -349,7 +370,7 @@ foreach ($marker in @(
     }
 }
 foreach ($marker in @(
-    'maven(rootProject.file("../plugins/flv_lzc/android/libs"))',
+    'rootProject.project(":flv_lzc").projectDir.resolve("libs")',
     'includeModule("io.github.flutterplayer", "fplayer-core")'
 )) {
     if (-not $androidRootBuild.Contains($marker)) {
@@ -463,10 +484,22 @@ if ([regex]::Matches($allPlatformWorkflow, '(?m)^\s+default:\s+true\s*$').Count 
     throw 'All-platform workflow platform/release inputs must default to false.'
 }
 foreach ($workflowText in @($featureWorkflow, $allPlatformWorkflow)) {
-    foreach ($marker in @('choco install innosetup --version=6.7.1', 'dart pub global activate fastforge 0.6.0')) {
+    foreach ($marker in @('choco install innosetup --version=6.7.1')) {
         if (-not $workflowText.Contains($marker)) {
             throw "Windows packaging dependency is not pinned: $marker"
         }
+    }
+    # Fastforge must be activated at an exact version. The version itself lives in
+    # one place (an env constant) so bumping it does not mean editing every call
+    # site; what this gate forbids is an unpinned activation or a mutable clone.
+    if (-not ($workflowText -match 'FASTFORGE_VERSION:\s*"(?<v>\d+\.\d+\.\d+)"')) {
+        throw 'Windows workflow must pin FASTFORGE_VERSION to an exact release.'
+    }
+    if (-not $workflowText.Contains('dart pub global activate fastforge')) {
+        throw 'Windows workflow must activate fastforge from the pinned release.'
+    }
+    if ($workflowText -match 'dart pub global activate fastforge\s+(?!--version)["'']?[^\s"\r\n]*latest') {
+        throw 'Windows workflow must not activate a floating fastforge version.'
     }
     if ($workflowText.Contains('git clone https://github.com/SlotSun/fastforge.git')) {
         throw 'Windows workflow must not install Fastforge from a mutable branch.'
@@ -548,64 +581,90 @@ $androidManifest = Get-Content -LiteralPath (Join-Path $repoRoot 'android\app\sr
 if ($androidManifest -match 'enableOnBackInvokedCallback="false"') {
     throw 'Android predictive back must not be disabled.'
 }
-$livePage = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\modules\live_play\pages\live_play_page.dart') -Raw
-$liveController = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\modules\live_play\controllers\live_play_controller.dart') -Raw
-if (-not $livePage.Contains('LivePlayBackScope(') -or -not $liveController.Contains('exitPresentationForSystemBack')) {
+$livePage = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\domains\live\presentation\playback\pages\live_play_page.dart') -Raw
+$liveController = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\domains\live\presentation\playback\controllers\live_play_controller.dart') -Raw
+if (-not $livePage.Contains('PlayerBackScope(') -or -not $liveController.Contains('exitPresentationForSystemBack')) {
     throw 'Live room route-local back handling is missing.'
 }
 if ($liveController.Contains('BackButtonInterceptor') -or $liveController.Contains('clearListener();`r`n    return false')) {
     throw 'Live room must not use the legacy global back interceptor or pre-pop listener teardown.'
 }
 
-$generalSettings = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\modules\settings\pages\general_settings_page.dart') -Raw
+$generalSettings = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\features\settings\pages\general_settings_page.dart') -Raw
 if (-not $generalSettings.Contains('Platform.isAndroid || Platform.isWindows') -or
     -not $generalSettings.Contains('_showRefreshRateModeDialog(context)')) {
     throw 'Android and Windows must both expose the shared refresh-rate policy.'
 }
-$backupPage = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\modules\backup\backup_page.dart') -Raw
-$fileUtils = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\plugins\file_utils.dart') -Raw
+$backupPage = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\features\backup\backup_page.dart') -Raw
+$fileUtils = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\core\platform\file_utils.dart') -Raw
 if (-not $backupPage.Contains('LogFileWriter.resolveLogDirectory()') -or
     -not $backupPage.Contains('await FileUtils.openFileOrUrl(logDir.path)') -or
     -not $fileUtils.Contains('ProcessStartMode.detached')) {
     throw 'Desktop/MSIX directory opening must use the canonical log directory and checked shell launch.'
 }
 
-$normalLayout = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\modules\live_play\widgets\layout\live_play_content.dart') -Raw
+$normalLayout = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\domains\live\presentation\playback\widgets\layout\live_play_content.dart') -Raw
 foreach ($marker in @('live-play-portrait-stack', 'live-play-desktop-panel', 'live-play-video-only-layout')) {
     if (-not $normalLayout.Contains($marker)) {
         throw "Normal live-room layout invariant marker is missing: $marker"
     }
 }
-$liveVideoFrame = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\modules\live_play\widgets\layout\live_play_video.dart') -Raw
+$liveVideoFrame = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\domains\live\presentation\playback\widgets\layout\live_play_video.dart') -Raw
 if (-not $liveVideoFrame.Contains('this.expandToParent = false') -or
     -not $liveVideoFrame.Contains('return AspectRatio(aspectRatio: 16 / 9, child: child)')) {
     throw 'Ordinary landscape rooms must retain the legacy 16:9 video-frame contract.'
 }
-$playerManager = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\player\core\player_manager.dart') -Raw
-if ($playerManager.Contains('return FittedBox(') -or $playerManager.Contains('StreamBuilder<List<int?>>')) {
-    throw 'Native video adapters must remain the single aspect/BoxFit authority.'
-}
-$mediaKitAdapter = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\player\adapters\media_kit_adapter.dart') -Raw
-if (-not $mediaKitAdapter.Contains('_player.stream.videoParams.listen') -or
-    $mediaKitAdapter.Contains('_player.stream.width.listen') -or
-    $mediaKitAdapter.Contains('_player.stream.height.listen')) {
-    throw 'MediaKit geometry must publish one display-corrected decoder snapshot.'
-}
-$portraitSupport = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\player\core\portrait_stream_support.dart') -Raw
-foreach ($marker in @(
-    'stabilityDelay = const Duration(milliseconds: 500)',
-    'portraitThreshold = 0.90',
-    'landscapeThreshold = 1.10',
-    'resolveCompactWindowAspectRatio',
-    'resolveAndroidPipAspectRatio',
-    '1 / 2.39',
-    'minimumDanmakuHeight = 200'
-)) {
-    if (-not $portraitSupport.Contains($marker)) {
-        throw "Portrait-source presentation invariant marker is missing: $marker"
+# The native adapters and the aspect/BoxFit authority moved into the pinned
+# media_core packages, so the invariant is now verified against the resolved
+# package sources rather than a repository-local `lib/player/` tree that no longer
+# exists. A missing package is a configuration error, not a silent pass.
+function Assert-MediaCoreMarker {
+    param(
+        [Parameter(Mandatory = $true)][string] $PackageName,
+        [Parameter(Mandatory = $true)][string] $RelativePath,
+        # Either list may be empty: a caller asserting only "these strings are
+        # gone" must not be forced to also name something required.
+        [string[]] $Required = @(),
+        [string[]] $Forbidden = @(),
+        [Parameter(Mandatory = $true)][string] $FailureMessage
+    )
+    $entry = @($fplayerPackageConfig.packages | Where-Object { $_.name -eq $PackageName })
+    if ($entry.Count -ne 1) {
+        throw "Expected exactly one resolved $PackageName package, found $($entry.Count)."
+    }
+    $rootUri = [Uri]::new([Uri]::new($fplayerPackageConfigPath), [string]$entry[0].rootUri)
+    $path = Join-Path $rootUri.LocalPath ($RelativePath -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "$FailureMessage (missing $PackageName/$RelativePath)"
+    }
+    $text = Get-Content -LiteralPath $path -Raw
+    foreach ($marker in $Required) {
+        if (-not $text.Contains($marker)) { throw "$FailureMessage (missing '$marker')" }
+    }
+    foreach ($marker in $Forbidden) {
+        if ($text.Contains($marker)) { throw "$FailureMessage (found forbidden '$marker')" }
     }
 }
-$fullscreenPolicy = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\player\utils\fullscreen.dart') -Raw
+
+# Geometry is no longer published by the MediaKit adapter: the player packages
+# own one display-corrected snapshot in media_core_presentation, and the adapter
+# must not resurrect per-axis width/height listeners that would let a rotated
+# frame publish a half-updated size.
+Assert-MediaCoreMarker -PackageName 'media_core_media_kit' `
+    -RelativePath 'lib/src/media_kit_player_adapter.dart' `
+    -Forbidden @('_player.stream.width.listen', '_player.stream.height.listen') `
+    -FailureMessage 'MediaKit adapter must not publish per-axis geometry.'
+Assert-MediaCoreMarker -PackageName 'media_core_presentation' `
+    -RelativePath 'lib/src/video_presentation_geometry.dart' `
+    -Required @('portraitThreshold', 'landscapeThreshold', 'resolveCompactWindowAspectRatio', 'resolveAndroidPipAspectRatio') `
+    -FailureMessage 'Portrait-source presentation invariant marker is missing.'
+$portraitSupport = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\core\player\core\portrait_stream_support.dart') -Raw
+foreach ($marker in @('minimumDanmakuHeight = 200', 'VideoPresentationPolicy')) {
+    if (-not $portraitSupport.Contains($marker)) {
+        throw "Portrait-source forwarding invariant marker is missing: $marker"
+    }
+}
+$fullscreenPolicy = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\core\player\presentation\fullscreen_window.dart') -Raw
 if (-not $fullscreenPolicy.Contains('supportsOrientationLockForLogicalDisplay') -or
     -not $fullscreenPolicy.Contains('logicalDisplaySize.shortestSide < 600')) {
     throw 'Android large-screen orientation policy must remain adaptive.'

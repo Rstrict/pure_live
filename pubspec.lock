@@ -173,10 +173,10 @@ packages:
     dependency: "direct main"
     description:
       name: best_form_validator
-      sha256: "78a602ad6750eafff2997e341833b6af5058bd784bc695cca2a8b6e0c6aeb4cc"
+      sha256: be42ccf38cebcb06c96da4f04190b050f5a91eb93ad951b3bd22ada5265df032
       url: "https://pub.dev"
     source: hosted
-    version: "1.4.0"
+    version: "1.4.2"
   better_player_plus:
     dependency: transitive
     description:

@@ -1,0 +1,148 @@
+# Collect the hosted build records for one release tag.
+#
+# This is the bridge between "a hosted build produced artifacts" and "those
+# artifacts are ready to be published": it downloads what each platform stage
+# uploaded, checks that every requested platform actually delivered, and stages
+# the result as one artifact set keyed by the version. It does not sign and it
+# does not publish — `publish-staged-release.yml` owns that, and keeping the two
+# apart means a failed download can never be mistaken for a failed release.
+name: Stage Hosted Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag whose hosted artifacts should be staged
+        required: true
+        type: string
+        default: v3.1.19
+      expect_android:
+        description: Require the Android artifact
+        required: true
+        type: boolean
+        default: false
+      expect_windows:
+        description: Require the Windows artifact
+        required: true
+        type: boolean
+        default: false
+      expect_linux:
+        description: Require the Linux artifact
+        required: true
+        type: boolean
+        default: false
+      expect_apple:
+        description: Require the Apple artifacts
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage-hosted-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    name: Stage the hosted artifacts
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify the tag matches the source version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'pubspec.yaml has no semantic version.' }
+          if ($env:RELEASE_TAG -ne "v$version") {
+            throw "Tag $env:RELEASE_TAG does not match the source version v$version."
+          }
+          Write-Host "Staging artifacts for v$version"
+
+      - name: Download each requested platform
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECT_ANDROID: ${{ inputs.expect_android }}
+          EXPECT_WINDOWS: ${{ inputs.expect_windows }}
+          EXPECT_LINUX: ${{ inputs.expect_linux }}
+          EXPECT_APPLE: ${{ inputs.expect_apple }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path staged | Out-Null
+          # The build run for a tag is the source of truth. Anything that does not
+          # come out of that run is not staged, even if a similarly named file
+          # exists locally.
+          $runId = (gh run list --workflow build_pure_live_release.yml --limit 50 --json databaseId,headBranch,displayTitle |
+            ConvertFrom-Json |
+            Where-Object { $_.displayTitle -like "*$env:RELEASE_TAG*" } |
+            Select-Object -First 1).databaseId
+          if ([string]::IsNullOrWhiteSpace($runId)) {
+            throw "No hosted build run was found for $env:RELEASE_TAG."
+          }
+          gh run download $runId --dir staged
+          Write-Host "Downloaded artifacts from run $runId"
+
+      - name: Confirm every requested platform is present
+        shell: pwsh
+        env:
+          EXPECT_ANDROID: ${{ inputs.expect_android }}
+          EXPECT_WINDOWS: ${{ inputs.expect_windows }}
+          EXPECT_LINUX: ${{ inputs.expect_linux }}
+          EXPECT_APPLE: ${{ inputs.expect_apple }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $checks = @{
+            Android = @{ Wanted = $env:EXPECT_ANDROID; Pattern = '*.apk' }
+            Windows = @{ Wanted = $env:EXPECT_WINDOWS; Pattern = '*.exe' }
+            Linux   = @{ Wanted = $env:EXPECT_LINUX;   Pattern = '*.tar.gz' }
+            Apple   = @{ Wanted = $env:EXPECT_APPLE;   Pattern = '*.ipa' }
+          }
+          foreach ($name in $checks.Keys) {
+            $check = $checks[$name]
+            if ($check.Wanted -ne 'true') { continue }
+            $hits = @(Get-ChildItem -LiteralPath staged -Recurse -File -Filter $check.Pattern)
+            if ($hits.Count -eq 0) {
+              throw "$name was requested but no $($check.Pattern) artifact was downloaded."
+            }
+            Write-Host "$name : $($hits.Count) artifact(s)"
+          }
+
+      - name: Write the staging manifest
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $entries = Get-ChildItem -LiteralPath staged -Recurse -File | ForEach-Object {
+            [pscustomobject]@{
+              path   = $_.FullName.Substring((Resolve-Path staged).Path.Length + 1) -replace '\\', '/'
+              bytes  = $_.Length
+              sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+            }
+          }
+          # The manifest is what the publisher verifies against, so it has to name
+          # the exact bytes rather than a directory listing.
+          [pscustomobject]@{
+            release_tag = $env:RELEASE_TAG
+            staged_at   = (Get-Date).ToUniversalTime().ToString('o')
+            artifacts   = @($entries)
+          } | ConvertTo-Json -Depth 5 |
+            Out-File -FilePath staged\staging-manifest.json -Encoding utf8
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-release-artifacts
+          path: staged/**
+          if-no-files-found: error
+          retention-days: 14

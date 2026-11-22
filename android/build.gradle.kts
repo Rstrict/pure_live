@@ -18,6 +18,11 @@ allprojects {
                 includeModule("io.github.flutterplayer", "fplayer-core")
             }
         }
+        // Same mirror-first order as settings.gradle.kts: the canonical hosts stay
+        // as fallback so this works on any network, and an unreachable mirror only
+        // costs a lookup instead of failing the build.
+        maven("https://maven.aliyun.com/repository/google")
+        maven("https://maven.aliyun.com/repository/public")
         google()
         mavenCentral()
     }

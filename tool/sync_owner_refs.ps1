@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     # Rewrite the derived files instead of only reporting drift.
     [switch] $Apply,
@@ -58,13 +58,34 @@ $nativeOwner = Get-Setting 'PURELIVE_NATIVE_OWNER'
 $nativeRepo = Get-Setting 'PURELIVE_NATIVE_REPOSITORY'
 $tvRepo = Get-Setting 'PURELIVE_TV_REPOSITORY'
 
+# `media_kit` is a git dependency (see pubspec.lock), so its bundle manifest
+# resolves into the Pub cache rather than a repository-local `third_party/`
+# directory. Resolve it the way the build does instead of assuming a checkout
+# layout; a hard-coded path here reported "missing" and blocked the gate on a file
+# that moved, not on a stale owner reference.
+function Resolve-NativeBundleManifest {
+    $configPath = Join-Path $repoRoot '.dart_tool/package_config.json'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { return $null }
+    $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $package = @($config.packages | Where-Object { $_.name -eq 'media_kit' })
+    if ($package.Count -ne 1) { return $null }
+    $rootUri = [Uri]::new([Uri]::new($configPath), [string]$package[0].rootUri)
+    $manifest = Join-Path $rootUri.LocalPath 'hook/native_bundles.json'
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { return $null }
+    return $manifest
+}
+
+$nativeBundleManifest = Resolve-NativeBundleManifest
+
 # One entry per file: the repository whose URLs belong to which role. A URL is
 # rewritten when its repository name matches, whatever owner it currently
 # carries - that is what makes the owner rename work.
+#
+# `AbsolutePath` targets are resolved packages, not repository files, so they are
+# checked for owner drift but never treated as missing repository content.
 $targets = @(
     @{ Path = 'pubspec.yaml'; Repo = $nativeRepo; Owner = $nativeOwner; Note = 'native bundles (ffmpeg_kit_extended_config)' },
     @{ Path = 'tool/prefetch_android_native.ps1'; Repo = $nativeRepo; Owner = $nativeOwner; Note = 'native bundles (Android prefetch)' },
-    @{ Path = 'third_party/media_kit/hook/native_bundles.json'; Repo = $nativeRepo; Owner = $nativeOwner; Note = 'native bundles (libmpv)' },
     @{ Path = 'assets/version.json'; Repo = $selfRepo; Owner = $selfOwner; Note = 'download link' },
     @{ Path = 'assets/releases.json'; Repo = $selfRepo; Owner = $selfOwner; Note = 'release history' },
     @{ Path = '.github/workflows/build_pure_live_release.yml'; Repo = $selfRepo; Owner = $selfOwner; Note = 'release notes and asset links' },
@@ -75,12 +96,21 @@ $targets = @(
     @{ Path = '.github/workflows/build_pure_live_release.yml'; Repo = $tvRepo; Owner = $selfOwner; Note = 'TV repository link' },
     @{ Path = '.github/workflows/feature-build.yml'; Repo = $tvRepo; Owner = $selfOwner; Note = 'TV repository link' }
 )
+if ($nativeBundleManifest) {
+    $targets += @{
+        Path = $nativeBundleManifest
+        AbsolutePath = $true
+        Repo = $nativeRepo
+        Owner = $nativeOwner
+        Note = 'native bundles (libmpv)'
+    }
+}
 
 $problems = New-Object System.Collections.Generic.List[string]
 $changes = New-Object System.Collections.Generic.List[string]
 
 foreach ($target in $targets) {
-    $full = Join-Path $repoRoot $target.Path
+    $full = if ($target.AbsolutePath) { $target.Path } else { Join-Path $repoRoot $target.Path }
     if (-not (Test-Path -LiteralPath $full)) {
         $problems.Add("$($target.Path): missing (referenced by this script)")
         continue
@@ -102,6 +132,13 @@ foreach ($target in $targets) {
 
     $found = @($wrong | ForEach-Object { $_.Value } | Sort-Object -Unique)
     if ($Apply) {
+        if ($target.AbsolutePath) {
+            # This file belongs to a resolved git dependency, not to this
+            # repository: rewriting it would edit another project's checkout and
+            # the next `pub get` would silently undo it. Report instead.
+            $problems.Add("$($target.Path): owner drift inside a resolved dependency ($($found -join ', ')) - update the dependency, not this file")
+            continue
+        }
         $updated = [regex]::Replace($text, $pattern, "github.com/$($target.Owner)/$($target.Repo)/")
         # Write exactly the bytes git expects: UTF-8 without BOM, LF endings.
         $updated = $updated -replace "`r`n", "`n"

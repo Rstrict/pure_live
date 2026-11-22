@@ -11,6 +11,12 @@ pluginManagement {
     includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
 
     repositories {
+        // Mirrors first, then the canonical hosts as fallback. On networks where
+        // google()/mavenCentral() are slow or partially blocked, a missing mirror
+        // only costs a failed lookup while the canonical entry still resolves.
+        maven("https://maven.aliyun.com/repository/google")
+        maven("https://maven.aliyun.com/repository/public")
+        maven("https://maven.aliyun.com/repository/gradle-plugin")
         google()
         mavenCentral()
         gradlePluginPortal()

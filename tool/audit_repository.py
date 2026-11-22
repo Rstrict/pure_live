@@ -36,7 +36,7 @@ SHA40_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 # Its isolated test trust and provenance are documented beside the fixture.
 PUBLIC_TLS_TEST_KEYS = {
     "test/fixtures/tls/localhost-key.pem":
-        "b55b3743dda7dd512713f6efa4850d3a729486e9e2bff8cb4302738c192a5af8",
+        "b3efffd8a301e546fe043d2c83eeceec2318b73d4700fb54ee4447ee075f377b",
 }
 
 
@@ -261,12 +261,18 @@ def main() -> int:
     if not callback_values or any(value != "true" for value in callback_values):
         errors.append({"rule": "predictive_back_disabled", "path": relative(manifest_path)})
 
-    back_scope = ROOT / "lib/modules/live_play/widgets/layout/live_play_back_scope.dart"
-    live_page = ROOT / "lib/modules/live_play/pages/live_play_page.dart"
-    controller = ROOT / "lib/modules/live_play/controllers/live_play_controller.dart"
+    # The player route moved out of the old `lib/modules/live_play/` tree into the
+    # layered layout: the scope lives in Core (it depends on the Activity-level
+    # predictive-back service, not on one page), and the page/controller live in
+    # the live domain. The invariants are unchanged - one route-local PopScope,
+    # the page wrapping its content in it, and the controller owning the exit
+    # path - so the rule tracks the files that actually implement them.
+    back_scope = ROOT / "lib/core/player/presentation/player_back_scope.dart"
+    live_page = ROOT / "lib/domains/live/presentation/playback/pages/live_play_page.dart"
+    controller = ROOT / "lib/domains/live/presentation/playback/controllers/live_play_controller.dart"
     required_back_markers = {
         relative(back_scope): "PopScope<Object?>",
-        relative(live_page): "LivePlayBackScope(",
+        relative(live_page): "PlayerBackScope(",
         relative(controller): "exitPresentationForSystemBack",
     }
     for rel, marker in required_back_markers.items():

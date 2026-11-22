@@ -1,0 +1,108 @@
+# Short-lived formal signing on a self-hosted runner.
+#
+# This is the local-runner counterpart of `sign-staged-android`: the APK is built
+# and verified on the machine that will sign it, so the keystore never leaves the
+# local runner and no hosted runner ever sees it. `sign-staged-android` exists for
+# the case where a staged artifact has to be signed from GitHub Secrets instead;
+# neither workflow makes the other redundant.
+#
+# Manual only. There is deliberately no `push:` trigger (the policy gate rejects
+# one) and no hosted runner label: a signing job that can start on demand from a
+# push, or run on infrastructure the repository does not control, is not a
+# short-lived signing step.
+name: Local Signed Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_full_regression:
+        description: Run the full regression suite before signing
+        required: true
+        type: boolean
+        default: false
+      skip_quality:
+        description: Skip the quality gate because a passing record already exists
+        required: true
+        type: boolean
+        default: false
+      release_tag:
+        description: Release tag this build is signed against
+        required: true
+        type: string
+        default: v3.1.19
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-signed-android-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    name: Build, verify and sign on the local runner
+    runs-on: [self-hosted, windows, x64, pure-live-local]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Quality gate
+        if: ${{ !inputs.skip_quality }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # -SkipQuality is the documented retry path: a passed record already
+          # exists for this source, so only packaging is being re-run. It is not
+          # available through this step's condition by accident - the input above
+          # is the only way to reach it.
+          $arguments = @('-ExecutionPolicy', 'Bypass', '-File', '.\tool\local_ci.ps1', '-Scope', 'Full')
+          & powershell @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Quality gate failed with exit code $LASTEXITCODE." }
+
+      - name: Build and verify the release APK
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # -FullRegression controls the test breadth of the build wrapper; the
+          # APK is verified by the wrapper's own `verify_android_apk.ps1` call.
+          $arguments = @(
+            '-ExecutionPolicy', 'Bypass',
+            '-File', '.\tool\build_local_release.ps1',
+            '-Target', 'AndroidArm64',
+            '-Configuration', 'Release',
+            '-RequireReleaseSigning'
+          )
+          if ('${{ inputs.run_full_regression }}' -eq 'true') { $arguments += '-FullRegression' }
+          if ('${{ inputs.skip_quality }}' -eq 'true') { $arguments += '-SkipQuality' }
+          & powershell @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Release build failed with exit code $LASTEXITCODE." }
+
+      - name: Record the signed artifact hash
+        id: artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $apk = Get-ChildItem -LiteralPath build\app\outputs\flutter-apk -Filter '*-release.apk' -Recurse |
+            Select-Object -First 1
+          if ($null -eq $apk) { throw 'No release APK was produced.' }
+          $hash = (Get-FileHash -LiteralPath $apk.FullName -Algorithm SHA256).Hash
+          "apk=$($apk.FullName)" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          @(
+            '### Local signed Android APK',
+            '',
+            "- Release tag: ``${{ inputs.release_tag }}``",
+            "- APK: ``$($apk.Name)``",
+            "- SHA-256: ``$hash``"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: local-signed-android
+          path: ${{ steps.artifact.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 14

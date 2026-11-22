@@ -7,27 +7,27 @@ on:
         description: Build Android Release APKs for all ABIs
         required: true
         type: boolean
-        default: true
+        default: false
       build_windows:
         description: Build Windows EXE, MSIX and portable ZIP
         required: true
         type: boolean
-        default: true
+        default: false
       build_linux:
         description: Build Linux x64 DEB and portable archives
         required: true
         type: boolean
-        default: true
+        default: false
       build_macos:
         description: Build macOS universal application archive
         required: true
         type: boolean
-        default: true
+        default: false
       build_ios:
         description: Build unsigned iOS app and TrollStore IPA
         required: true
         type: boolean
-        default: true
+        default: false
       run_quality:
         description: Run analyze, tests and public interface probes first
         required: true
@@ -203,13 +203,18 @@ jobs:
           retention-days: 3
   windows:
     name: Windows EXE + MSIX + Portable
+    # Serial platform stages (BUILD_POLICY `serial-platform-stages`): Windows
+    # only starts once Android finished, and it skips when Android was not
+    # requested. Concurrent all-platform packaging is explicitly forbidden, so
+    # each stage waits for the previous one instead of fanning out from quality.
     if: >-
       ${{
         always() &&
         inputs.build_windows &&
-        (needs.quality.result == 'success' || needs.quality.result == 'skipped')
+        (needs.quality.result == 'success' || needs.quality.result == 'skipped') &&
+        (needs.android.result == 'success' || needs.android.result == 'skipped')
       }}
-    needs: [quality]
+    needs: [quality, android]
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
@@ -365,13 +370,16 @@ jobs:
           retention-days: 3
   linux:
     name: Linux x64 DEB + portable
+    # Serial stage: waits for Android and Windows.
     if: >-
       ${{
         always() &&
         inputs.build_linux &&
-        (needs.quality.result == 'success' || needs.quality.result == 'skipped')
+        (needs.quality.result == 'success' || needs.quality.result == 'skipped') &&
+        (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+        (needs.windows.result == 'success' || needs.windows.result == 'skipped')
       }}
-    needs: [quality]
+    needs: [quality, android, windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
@@ -486,12 +494,16 @@ jobs:
           retention-days: 3
   apple:
     name: Apple platform packages
+    # Serial stage: waits for Android, Windows and Linux.
     if: >-
       ${{
         always() &&
         (inputs.build_macos || inputs.build_ios) &&
-        (needs.quality.result == 'success' || needs.quality.result == 'skipped') }}
-    needs: [quality]
+        (needs.quality.result == 'success' || needs.quality.result == 'skipped') &&
+        (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+        (needs.windows.result == 'success' || needs.windows.result == 'skipped') &&
+        (needs.linux.result == 'success' || needs.linux.result == 'skipped') }}
+    needs: [quality, android, windows, linux]
     runs-on: macos-15
     timeout-minutes: 90
     steps:

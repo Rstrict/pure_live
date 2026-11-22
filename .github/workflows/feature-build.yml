@@ -1,0 +1,291 @@
+# Single-feature build entrypoint.
+#
+# A feature build packages one change for one platform set. It is deliberately
+# harsher than the all-platform release in two ways:
+#
+#   * platform stages are serial (`serial-platform-stages`): Android, then
+#     Windows, then Linux, then Apple. A stage starts only after the previous one
+#     finished, so a broken Android build never spends Windows/Linux/Apple quota;
+#   * every platform input defaults to false. Building is opt-in for this
+#     repository, and an accidental default would burn Actions minutes on every
+#     manual run.
+#
+# Tags are one platform at a time (`stage-android-`, `stage-windows-`,
+# `stage-linux-`, `stage-macos-`, `stage-ios-`). A single shared build tag or a
+# combined Apple tag would let one upload overwrite another platform's staged
+# artifact.
+name: Feature Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_android:
+        description: Build the Android release APK for arm64
+        required: true
+        type: boolean
+        default: false
+      build_windows:
+        description: Build the Windows package
+        required: true
+        type: boolean
+        default: false
+      build_linux:
+        description: Build the Linux package
+        required: true
+        type: boolean
+        default: false
+      build_macos:
+        description: Build the macOS application
+        required: true
+        type: boolean
+        default: false
+      build_ios:
+        description: Build the unsigned iOS application
+        required: true
+        type: boolean
+        default: false
+      run_full_regression:
+        description: Run the full regression suite instead of the focused gate
+        required: true
+        type: boolean
+        default: false
+      feature_tag:
+        description: Staged artifact tag prefix (one platform, e.g. stage-android-)
+        required: true
+        type: string
+        default: stage-android-
+      release_tag:
+        description: Release tag this feature build is staged against
+        required: true
+        type: string
+        default: v3.1.19
+
+permissions:
+  contents: read
+
+# One place owns the packaging toolchain version so a bump is one edit.
+env:
+  FASTFORGE_VERSION: "0.6.12"
+
+concurrency:
+  group: feature-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Quality gate
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the pinned Flutter SDK
+        shell: pwsh
+        run: ./tool/flutterw.ps1 --version
+      - name: Resolve the locked dependency graph
+        shell: pwsh
+        run: ./tool/flutterw.ps1 pub get --enforce-lockfile
+      - name: Analyze
+        shell: pwsh
+        run: ./tool/flutterw.ps1 analyze --no-pub --no-fatal-infos --no-fatal-warnings
+      - name: Test
+        shell: pwsh
+        run: |
+          # Pinned concurrency keeps the timing-sensitive tests comparable
+          # between runs; `-FullRegression` is the switch, not a second script.
+          if ('${{ inputs.run_full_regression }}' -eq 'true') {
+            ./tool/flutterw.ps1 test --no-pub --concurrency=12
+          } else {
+            ./tool/flutterw.ps1 test --no-pub --concurrency=12 test/core test/domains
+          }
+          if ($LASTEXITCODE -ne 0) { throw "flutter test --concurrency=12 failed." }
+
+  version:
+    name: Resolve the artifact version
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact_version: ${{ steps.version.outputs.artifact_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        name: Read the semantic version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -E '^version: ' pubspec.yaml | head -n1 | sed -E 's/^version: *//')
+          echo "artifact_version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved artifact version: $version"
+
+  android:
+    name: Android arm64 release
+    needs: quality
+    if: ${{ always() && inputs.build_android && (needs.quality.result == 'success' || needs.quality.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prefetch verified Firebase C++ SDK
+        shell: bash
+        run: ./tool/prefetch_android_native.ps1 -SkipAndroidMedia || true
+      - name: Build the arm64 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build apk --release --target-platform android-arm64
+      - name: Name the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.artifact_version }}"
+          mkdir -p artifacts
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "artifacts/PureLive-${VERSION}-android-arm64-v8a-release.apk"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: feature-android
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Windows package
+    needs: [quality, android]
+    if: >-
+      ${{
+        always() &&
+        inputs.build_windows &&
+        (!inputs.build_android || needs.android.result == 'success')
+      }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin the packaging toolchain
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.7.1 -y --no-progress
+          dart pub global activate fastforge $env:FASTFORGE_VERSION
+      - name: Build the Windows package
+        shell: pwsh
+        run: |
+          ./tool/flutterw.ps1 build windows --release
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: feature-windows
+          path: build/windows/**/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Linux package
+    needs: [quality, android, windows]
+    if: >-
+      ${{
+        always() &&
+        inputs.build_linux &&
+        (!inputs.build_windows || needs.windows.result == 'success')
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the desktop toolchain
+        run: |
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - name: Build the Linux package
+        run: |
+          set -euo pipefail
+          ./tool/flutterw.ps1 build linux --release
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: feature-linux
+          path: build/linux/**/bundle/**
+          if-no-files-found: error
+          retention-days: 7
+
+  apple:
+    name: Apple package
+    needs: [quality, android, windows, linux]
+    if: >-
+      ${{
+        always() &&
+        (inputs.build_macos || inputs.build_ios) &&
+        (!(inputs.build_android) || needs.android.result == 'success') &&
+        (!inputs.build_windows || needs.windows.result == 'success') &&
+        (!inputs.build_linux || needs.linux.result == 'success')
+      }}
+    runs-on: macos-15
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the macOS application
+        if: ${{ inputs.build_macos }}
+        run: |
+          set -euo pipefail
+          ./tool/flutterw.ps1 build macos --release
+      - name: Build the unsigned iOS application
+        if: ${{ inputs.build_ios }}
+        run: |
+          set -euo pipefail
+          ./tool/flutterw.ps1 build ios --release --no-codesign
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: feature-apple
+          path: |
+            build/macos/**/*.app
+            build/ios/**/*.app
+          if-no-files-found: error
+          retention-days: 7
+
+  stage:
+    name: Stage the platform artifact
+    needs: [quality, version, android, windows, linux, apple]
+    if: >-
+      ${{
+        always() &&
+        !inputs.build_windows || needs.windows.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Confirm the staged platform matches the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.feature_tag }}'
+          case "$tag" in
+            stage-android-*|stage-windows-*|stage-linux-*|stage-macos-*|stage-ios-*) ;;
+            *) echo "Staged tag must name exactly one platform: $tag" >&2; exit 1 ;;
+          esac
+          echo "Staging $tag for version ${{ needs.version.outputs.artifact_version }}"
+      - name: Confirm every requested platform succeeded
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A partially built feature must not be staged as if it were complete.
+          # `!(inputs.build_macos || inputs.build_ios) || needs.apple.result == 'success'`
+          # is the contract: the Apple stage is only optional when neither Apple
+          # platform was requested.
+          wants_apple=false
+          [ '${{ inputs.build_macos }}' = 'true' ] && wants_apple=true
+          [ '${{ inputs.build_ios }}' = 'true' ] && wants_apple=true
+          if [ "$wants_apple" = 'true' ] && [ '${{ needs.apple.result }}' != 'success' ]; then
+            echo 'Apple stage did not succeed.' >&2
+            exit 1
+          fi
+          echo 'All requested platforms succeeded.'

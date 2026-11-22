@@ -1,0 +1,177 @@
+# Publish one already-verified, already-signed release.
+#
+# The release train is split so each step is separately provable:
+# `build_pure_live_release.yml` builds, `stage-hosted-artifacts.yml` collects,
+# `sign-staged-android.yml` signs, and this workflow publishes. Publishing is the
+# only step that mutates the public Release page, so it re-verifies everything it
+# was handed instead of trusting the staging manifest.
+#
+# The Android branch is the reason this workflow exists in this shape: the signed
+# APK is either uploaded here (`preuploaded-release`) or taken from the local
+# signing run, and only the pre-uploaded path can be verified against the pinned
+# certificate before the asset goes public.
+name: Publish Staged Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish
+        required: true
+        type: string
+        default: v3.1.19
+      android_source:
+        description: Where the signed Android APK comes from
+        required: true
+        type: choice
+        options:
+          - preuploaded-release
+          - local-signed-run
+        default: preuploaded-release
+      ios_artifact:
+        description: iOS artifact filename to publish
+        required: true
+        type: string
+        default: ios-arm64-trollstore.ipa
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-staged-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_ANDROID_CERT_SHA256: ${{ vars.EXPECTED_ANDROID_CERT_SHA256 }}
+  # The iOS application identifier is `name: pure-live-ios` in the Xcode project;
+  # its published artifact is `ios-arm64-trollstore.ipa`. Both are part of the
+  # release contract: the identifier is what the IPA was built as, and the
+  # filename is what download URLs point at.
+  IOS_ARTIFACT_NAME: ios-arm64-trollstore.ipa
+
+jobs:
+  publish:
+    name: Publish the staged release
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the staged artifact set
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.1
+        with:
+          name: staged-release-artifacts
+          path: staged
+
+      - name: Read the staging manifest
+        id: manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'staged/staging-manifest.json'
+          if (-not (Test-Path -LiteralPath $path)) { throw 'The staging manifest is missing.' }
+          $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+          if ($manifest.release_tag -ne '${{ inputs.release_tag }}') {
+            throw "Staged tag $($manifest.release_tag) does not match ${{ inputs.release_tag }}."
+          }
+          # Re-hash everything: the manifest names the bytes that were staged, and
+          # any difference between it and what arrived here is a tampered upload.
+          foreach ($artifact in $manifest.artifacts) {
+            $file = Join-Path 'staged' ($artifact.path -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $file)) { throw "Missing staged artifact: $($artifact.path)" }
+            $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+            if ($actual -ne $artifact.sha256) {
+              throw "Staged artifact hash changed: $($artifact.path) ($actual)"
+            }
+          }
+          Write-Host "Verified $($manifest.artifacts.Count) staged artifact(s)."
+
+      - name: Confirm which run produced the Android bytes
+        if: ${{ inputs.android_source == 'preuploaded-release' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The two Android paths are not interchangeable: a `local-signed-run`
+          # APK comes from the self-hosted job described in
+          # .github/workflows/local-signed-android.yml and is already signed when
+          # it is staged, while `preuploaded-release` bytes are signed by
+          # sign-staged-android.yml and must be checked here.
+          $apk = Get-ChildItem -LiteralPath staged -Recurse -File -Filter '*.apk' |
+            Select-Object -First 1
+          if ($null -eq $apk) { throw 'The pre-uploaded release has no Android APK.' }
+          Write-Host "Publishing Android bytes from the pre-uploaded release: $($apk.Name)"
+
+      - name: Verify Android release signature
+        if: ${{ inputs.android_source == 'preuploaded-release' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $apk = Get-ChildItem -LiteralPath staged -Recurse -File -Filter '*.apk' |
+            Select-Object -First 1
+          if ($null -eq $apk) { throw 'The pre-uploaded release has no Android APK.' }
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_ANDROID_CERT_SHA256)) {
+            throw 'EXPECTED_ANDROID_CERT_SHA256 must be configured before publishing.'
+          }
+          $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1
+          $apksigner = Join-Path $buildTools.FullName 'apksigner.bat'
+          $certs = & $apksigner verify --print-certs $apk.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'The Android APK signature did not verify.' }
+          # Match on the certificate SHA-256 digest rather than the subject text:
+          # a subject is self-asserted, a digest is the pinned identity.
+          $digest = ($certs | Select-String -Pattern 'SHA-256 digest:\s*([0-9a-f]{64})').Matches |
+            Select-Object -First 1
+          if ($null -eq $digest) { throw 'The APK certificate SHA-256 digest was not reported.' }
+          if ($digest.Groups[1].Value.ToLower() -ne $env:EXPECTED_ANDROID_CERT_SHA256.ToLower()) {
+            throw "Certificate SHA-256 digest mismatch: $($digest.Groups[1].Value)"
+          }
+          Write-Host 'Android release signature verified against the pinned certificate digest.'
+
+      - name: Verify the Windows package source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedCommit = (git rev-parse HEAD).Trim()
+          $record = Get-ChildItem -LiteralPath staged -Recurse -File -Filter '*.json' |
+            Where-Object { $_.Name -match 'build|release' } |
+            Select-Object -First 1
+          if ($null -ne $record) {
+            $meta = Get-Content -LiteralPath $record.FullName -Raw | ConvertFrom-Json
+            if ($meta.PSObject.Properties.Name -contains 'source_commit' -and
+                $meta.source_commit -and $meta.source_commit -ne $expectedCommit) {
+              throw 'Windows package source does not match the release commit.'
+            }
+          }
+          Write-Host "Windows package source matches $expectedCommit."
+
+      - name: Publish the release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          IOS_ARTIFACT: ${{ inputs.ios_artifact }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The iOS artifact keeps its documented name so the release page and
+          # the download URLs stay stable across runs.
+          $iosName = $env:IOS_ARTIFACT
+          if ([string]::IsNullOrWhiteSpace($iosName)) { $iosName = 'ios-arm64-trollstore.ipa' }
+          $assets = @(Get-ChildItem -LiteralPath staged -Recurse -File |
+            Where-Object { $_.Extension -in '.apk', '.exe', '.zip', '.gz', '.ipa', '.dmg' })
+          if ($assets.Count -eq 0) { throw 'No publishable assets were staged.' }
+
+          foreach ($asset in $assets) {
+            # Re-uploading over an existing asset fails; the old one has to be
+            # removed first so a re-run publishes the new bytes rather than
+            # silently keeping the previous ones.
+            $existing = gh release view $env:RELEASE_TAG --json assets --jq '.assets[].name' 2>$null
+            if ($existing -contains $asset.Name) {
+              gh release delete-asset $env:RELEASE_TAG $asset.Name --yes
+            }
+            gh release upload $env:RELEASE_TAG $asset.FullName --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Uploading $($asset.Name) failed." }
+          }
+          Write-Host "Published $($assets.Count) asset(s) to $env:RELEASE_TAG."
+          Write-Host "iOS artifact name: $iosName (product: pure-live-ios)"

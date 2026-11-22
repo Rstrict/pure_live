@@ -1,0 +1,137 @@
+# Read-only inventory of an inbound upstream update.
+#
+# UPSTREAM_REVIEW_POLICY describes two entry points: this workflow, and the
+# local gate. This one only *reports*: it freezes the incoming upstream ref,
+# walks every inbound commit and file, scans all tracked files on the current
+# branch, and uploads the JSON evidence. It never merges, never pushes and never
+# publishes, which is why it asks for nothing beyond read-only repository
+# access. The mandatory gate that can actually approve a merge runs locally and
+# is not reachable from here.
+#
+# Manual only: an upstream audit is a deliberate act, and it competes for Actions
+# quota with builds and releases.
+name: Audit Upstream Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repository:
+        description: Upstream repository in owner/name form
+        required: true
+        type: string
+        default: liuchuancong/pure_live
+      upstream_ref:
+        description: Upstream ref to freeze (branch name or full 40-character commit)
+        required: true
+        type: string
+        default: master
+      base_ref:
+        description: Local ref the incoming range is measured from
+        required: true
+        type: string
+        default: HEAD
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Freeze and inventory the incoming range
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the branch under review
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The audit only reads history; a shallow clone could not resolve the
+          # merge base between the branch and the upstream range.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record the frozen upstream commit
+        id: freeze
+        shell: pwsh
+        env:
+          UPSTREAM_REPOSITORY: ${{ inputs.upstream_repository }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git remote add upstream "https://github.com/$env:UPSTREAM_REPOSITORY.git"
+          # --prune keeps a deleted upstream branch from looking alive.
+          git fetch --prune --tags upstream
+          # Resolve the requested ref to a full commit so the evidence names an
+          # immutable object rather than a moving branch name.
+          $resolved = (git rev-parse "upstream/$env:UPSTREAM_REF").Trim()
+          if ($LASTEXITCODE -ne 0 -or $resolved.Length -ne 40) {
+            throw "Could not resolve upstream/$env:UPSTREAM_REF to a 40-character commit."
+          }
+          "commit=$resolved" >> $env:GITHUB_OUTPUT
+          Write-Host "Frozen upstream commit: $resolved"
+
+      - name: Inventory the inbound range (report only)
+        shell: pwsh
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          UPSTREAM_COMMIT: ${{ steps.freeze.outputs.commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path local-artifacts\upstream-reports | Out-Null
+          $report = "local-artifacts/upstream-reports/$($env:UPSTREAM_COMMIT).json"
+          # -ReportOnly makes this a measurement: no merge, no approval, no
+          # document requirement. The blocking gate is the local one.
+          ./tool/review_upstream_update.ps1 `
+            -BaseRef $env:BASE_REF `
+            -UpstreamRef $env:UPSTREAM_COMMIT `
+            -OutputPath $report `
+            -ReportOnly
+          if ($LASTEXITCODE -ne 0) { throw "Upstream report failed with exit code $LASTEXITCODE." }
+          Write-Host "Report written to $report"
+
+      - name: Audit every tracked file on this branch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The incoming range is only half the question: a merge also has to be
+          # safe against what is already here. `audit_repository.py` is the same
+          # scanner the local gate runs, so this report and the local gate agree
+          # on what "clean" means.
+          New-Item -ItemType Directory -Force -Path local-artifacts\repository-audits | Out-Null
+          python tool/audit_repository.py --output local-artifacts/repository-audits/workflow-audit.json
+          if ($LASTEXITCODE -ne 0) { throw "Repository audit failed with exit code $LASTEXITCODE." }
+
+      - name: Upload the evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-audit-${{ steps.freeze.outputs.commit }}
+          path: |
+            local-artifacts/upstream-reports/*.json
+            local-artifacts/repository-audits/*.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summarize what was audited
+        shell: pwsh
+        env:
+          UPSTREAM_COMMIT: ${{ steps.freeze.outputs.commit }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          $reportPath = "local-artifacts/upstream-reports/$($env:UPSTREAM_COMMIT).json"
+          if (-not (Test-Path -LiteralPath $reportPath)) { throw 'Report file was not produced.' }
+          $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+          $commits = @($report.commits).Count
+          $files = @($report.files).Count
+          @(
+            "### Upstream audit (read-only)",
+            '',
+            "- Frozen upstream commit: ``$($env:UPSTREAM_COMMIT)``",
+            "- Base ref: ``$($env:BASE_REF)``",
+            "- Inbound commits inventoried: $commits",
+            "- Inbound files inventoried: $files",
+            "- Report only: no merge, no approval, no release.",
+            '',
+            'A merge still requires the local gate described in `UPSTREAM_REVIEW_POLICY.md`.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

@@ -1,0 +1,216 @@
+# Short-lived formal signing for a locally staged Android APK.
+#
+# BUILD_POLICY stage 5: the release APK is built and verified on the local
+# machine, then this workflow signs that already-verified artifact with the
+# repository keystore from GitHub Secrets. It deliberately does not build: signing
+# is a short, auditable step, and re-running a remote Flutter/Gradle build here
+# would cost Actions quota and let the signed bytes diverge from the verified
+# ones.
+#
+# The integrity gate matters more than the signing step. A staged APK is only
+# accepted when its Flutter asset bundle is complete, its native libraries are
+# present and 16 KB page-aligned, and `zipalign` confirms the alignment. Those
+# checks are the same ones `tool/verify_android_apk.ps1` performs locally, so a
+# tampered upload cannot be signed just because it parses as a ZIP.
+name: Sign Staged Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      staged_artifact:
+        description: Name of the staged APK artifact to sign
+        required: true
+        type: string
+        default: staged-android-arm64
+      expected_abi:
+        description: ABI the staged APK must contain
+        required: true
+        type: string
+        default: arm64-v8a
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-staged-android-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    name: Sign and verify the staged APK
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the branch that produced the staged APK
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the staged APK
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v7.0.1
+        with:
+          name: ${{ inputs.staged_artifact }}
+          path: staged
+
+      - name: Check the staged APK before it is signed
+        shell: pwsh
+        env:
+          EXPECTED_ABI: ${{ inputs.expected_abi }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $apk = Get-ChildItem -LiteralPath staged -Filter '*.apk' -Recurse |
+            Select-Object -First 1
+          if ($null -eq $apk) { throw 'No staged APK was found in the downloaded artifact.' }
+          Write-Host "Verifying $($apk.FullName)"
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($apk.FullName)
+          try {
+            $entries = $zip.Entries | ForEach-Object { $_.FullName }
+
+            # The asset bundle is what the app actually renders; a truncated
+            # bundle still signs and installs, so it has to be checked here.
+            $flutterAssets = @($entries | Where-Object { $_ -like 'assets/flutter_assets/*' })
+            if ($flutterAssets.Count -lt 100) {
+              throw "Flutter asset file count is incomplete: $($flutterAssets.Count)"
+            }
+            foreach ($required in @(
+              'assets/flutter_assets/AssetManifest.bin',
+              'assets/flutter_assets/assets/version.json'
+            )) {
+              if ($entries -notcontains $required) { throw "Required entry is missing: $required" }
+            }
+
+            # Native libraries carry the page-size contract; the media and
+            # database engines are the ones that must ship.
+            foreach ($library in @('libsqlite3.so', 'libffmpegkit.so')) {
+              $hit = @($entries | Where-Object {
+                $_ -like "lib/$env:EXPECTED_ABI/$library"
+              })
+              if ($hit.Count -ne 1) {
+                throw "Required native library is missing for $($env:EXPECTED_ABI): $library"
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+
+      - name: Confirm 16 KB ELF alignment with zipalign
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-StagedApk {
+            $apk = Get-ChildItem -LiteralPath staged -Filter '*.apk' -Recurse |
+              Select-Object -First 1
+            if ($null -eq $apk) { throw 'No staged APK was found.' }
+            return $apk
+          }
+
+          function Get-ZipAlign {
+            $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |
+              Sort-Object Name -Descending | Select-Object -First 1
+            if ($null -eq $buildTools) { throw 'Android build-tools were not found.' }
+            $zipalign = Join-Path $buildTools.FullName 'zipalign.exe'
+            if (-not (Test-Path -LiteralPath $zipalign -PathType Leaf)) {
+              throw "zipalign.exe is missing from $($buildTools.FullName)"
+            }
+            return $zipalign
+          }
+
+          # -P 16 asserts 16 KB page alignment of the uncompressed .so entries;
+          # -c is check-only and 4 is the verbosity level. The name is shared with
+          # the local gate so the same assertion is found in both places.
+          function verify_android_16kb {
+            param([Parameter(Mandatory = $true)][string] $ApkPath)
+            $zipalign = Get-ZipAlign
+            & "$zipalign" -c -P 16 4 "$ApkPath"
+            if ($LASTEXITCODE -ne 0) { throw 'Android 16 KB ELF alignment failed.' }
+            Write-Host "Android 16 KB ELF alignment verified: $ApkPath"
+          }
+
+          $final_apk = (Get-StagedApk).FullName
+          verify_android_16kb "$final_apk"
+
+      - name: Sign the verified APK
+        shell: pwsh
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:KEYSTORE_BASE64)) {
+            throw 'ANDROID_KEYSTORE_BASE64 is not configured for this repository.'
+          }
+          $apk = Get-ChildItem -LiteralPath staged -Filter '*.apk' -Recurse |
+            Select-Object -First 1
+          $keystore = Join-Path $env:RUNNER_TEMP 'release.keystore'
+          [IO.File]::WriteAllBytes($keystore, [Convert]::FromBase64String($env:KEYSTORE_BASE64))
+
+          $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1
+          $apksigner = Join-Path $buildTools.FullName 'apksigner.bat'
+          & $apksigner sign `
+            --ks $keystore `
+            --ks-key-alias $env:KEY_ALIAS `
+            --ks-pass "pass:$env:KEYSTORE_PASSWORD" `
+            --key-pass "pass:$env:KEY_PASSWORD" `
+            --v1-signing-enabled false `
+            --v2-signing-enabled true `
+            --v3-signing-enabled true `
+            $apk.FullName
+          if ($LASTEXITCODE -ne 0) { throw "apksigner failed with exit code $LASTEXITCODE." }
+
+          # Re-verify after signing: signing rewrites the archive, so the
+          # alignment guarantee has to be re-established, not assumed. Each step
+          # is its own PowerShell process, so the helper is declared again rather
+          # than trusted from the previous step's scope.
+          $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1
+          $zipalign = Join-Path $buildTools.FullName 'zipalign.exe'
+          & "$zipalign" -c -P 16 4 "$($apk.FullName)"
+          if ($LASTEXITCODE -ne 0) { throw 'Android 16 KB ELF alignment failed after signing.' }
+          & $apksigner verify --print-certs $apk.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Signed APK did not verify.' }
+
+          Remove-Item -LiteralPath $keystore -Force
+
+      - name: Verify the signed APK and record its hash
+        id: finalize
+        shell: pwsh
+        env:
+          EXPECTED_ABI: ${{ inputs.expected_abi }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $apk = Get-ChildItem -LiteralPath staged -Filter '*.apk' -Recurse |
+            Select-Object -First 1
+          # The repository verifier is the single owner of APK acceptance; running
+          # it after signing keeps the signed bytes under the same contract the
+          # local build was held to.
+          ./tool/verify_android_apk.ps1 -ApkPath $apk.FullName -ExpectedAbi $env:EXPECTED_ABI -BuildMode Release
+          if ($LASTEXITCODE -ne 0) { throw "APK verification failed with exit code $LASTEXITCODE." }
+
+          $hash = (Get-FileHash -LiteralPath $apk.FullName -Algorithm SHA256).Hash
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          $hash | Out-File -FilePath "$env:RUNNER_TEMP\APK-SHA256.txt" -Encoding ascii
+          @(
+            '### Signed Android APK',
+            '',
+            "- Artifact: ``$($apk.Name)``",
+            "- ABI: ``$($env:EXPECTED_ABI)``",
+            "- SHA-256: ``$hash``",
+            '',
+            'The APK was built and verified locally, then signed here; this workflow does not build.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload the signed APK and its hash
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-android-apk
+          path: |
+            staged/**/*.apk
+            ${{ runner.temp }}/APK-SHA256.txt
+          if-no-files-found: error
+          retention-days: 14

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     # local_ci needs Windows Native Assets archives. Release builds leave
     # this switch unset and also prefetch the Android media-kit/FFmpeg assets.
@@ -99,29 +99,39 @@ function Get-FFmpegBuilderProfile {
             AndroidSha256 = '2b66caaaefbe5032ffe6e32d87e1af398653ec8dbbc193f4481dd4f562f2182d'
             WindowsSha256 = '2367fbc6ecd7c5df1995c5c0cf5d95f65a99396d4d3fe9d1968c683d3481c125'
         }
-        # The 0.6.2 hook is retained, while its Android/Windows binaries are
-        # rebuilt from FFmpeg n9.0.2 and published as pinned project assets.
+        # ffmpeg_kit_extended_flutter 0.6.2 / FFmpeg 9.0.2.
+        #
+        # These are the upstream builder assets, not project-rebuilt ones. The
+        # 0.6.2 hook has no URL override and verifies whatever it downloads
+        # against the digest of the asset on that upstream release, so seeding its
+        # cache with different bytes only makes it delete them and fail the hash
+        # check. Both hashes below were confirmed by downloading the upstream
+        # archives and hashing them.
         '0.6.2' = @{
             BuilderVersion = '0.11.1'
             CacheVersion = '0.11.1-ffmpeg-9.0.2-b1'
-            AndroidSha256 = 'c6c9b1ff7be756b0fb587f98e05972ca4dae97e8275c22961b443b4fd5f49bf7'
-            WindowsSha256 = 'e61684a91f7471ba00f1d5b36a24e93ab602ef72bd57000d94990e7e0c5dfe3a'
-            AndroidUrl = 'https://github.com/wzgrx/pure_live/releases/download/native-ffmpeg-9.0.2-b1/bundle-base-shared-lgpl-release.aar'
-            WindowsUrl = 'https://github.com/wzgrx/pure_live/releases/download/native-ffmpeg-9.0.2-b1/bundle-base-windows-x86_64-shared-lgpl.zip'
+            AndroidSha256 = 'b214c2aafb20af5416989600826b2b7cb59c8f1572fb78547cc4a222b65134fc'
+            WindowsSha256 = 'ac4f7c6893eb2d2a7d9c1c7a08e8cad42105b509d097ce2b2eceabcdcbd7cb47'
         }
     }
     $profile = $profiles[$packageVersion]
     if ($null -eq $profile) {
         throw "No reviewed native-asset profile for ffmpeg_kit_extended_flutter $packageVersion"
     }
+    # Strict mode throws on a missing hashtable key, so an optional override is
+    # probed rather than read. No profile currently overrides the URLs: the 0.6.2
+    # hook has no override hook of its own, so the upstream releases are what it
+    # will accept.
+    $androidOverride = if ($profile.ContainsKey('AndroidUrl')) { $profile.AndroidUrl } else { $null }
+    $windowsOverride = if ($profile.ContainsKey('WindowsUrl')) { $profile.WindowsUrl } else { $null }
     return @{
         PackageVersion = $packageVersion
         BuilderVersion = $profile.BuilderVersion
         CacheVersion = if ($profile.CacheVersion) { $profile.CacheVersion } else { $profile.BuilderVersion }
         AndroidSha256 = $profile.AndroidSha256
         WindowsSha256 = $profile.WindowsSha256
-        AndroidUrl = if ($profile.AndroidUrl) { $profile.AndroidUrl } else { "https://github.com/akashskypatel/ffmpeg-kit-builders/releases/download/v$($profile.BuilderVersion)-android/bundle-base-shared-lgpl-release.aar" }
-        WindowsUrl = if ($profile.WindowsUrl) { $profile.WindowsUrl } else { "https://github.com/akashskypatel/ffmpeg-kit-builders/releases/download/v$($profile.BuilderVersion)-windows/bundle-base-windows-x86_64-shared-lgpl.zip" }
+        AndroidUrl = if ($androidOverride) { $androidOverride } else { "https://github.com/akashskypatel/ffmpeg-kit-builders/releases/download/v$($profile.BuilderVersion)-android/bundle-base-shared-lgpl-release.aar" }
+        WindowsUrl = if ($windowsOverride) { $windowsOverride } else { "https://github.com/akashskypatel/ffmpeg-kit-builders/releases/download/v$($profile.BuilderVersion)-windows/bundle-base-windows-x86_64-shared-lgpl.zip" }
     }
 }
 
@@ -225,3 +235,41 @@ Install-VerifiedAsset `
     -CachePath (Join-Path $persistentRoot "ffmpeg-kit\v$ffmpegCacheVersion-windows\$ffmpegWindowsName") `
     -Url $ffmpegProfile.WindowsUrl `
     -Sha256 $ffmpegProfile.WindowsSha256
+
+# Extract the verified archive ourselves.
+#
+# The hook extracts with `powershell -command Expand-Archive ... -Force` into a
+# `<name>.extracting` directory and then renames it. When that archive's entries
+# share the destination's own basename (they do here: the zip has a single
+# `bundle-base-windows-x86_64-shared-lgpl/` root), `-Force` deletes the just
+# created item and the per-entry write then fails with DirectoryNotFound, while
+# the exit code stays 0 — so the hook records an "extract complete" marker over an
+# empty tree and every later build fails listing a directory that is not there.
+#
+# Extracting with .NET's ZipFile avoids that path entirely and is byte-identical
+# in layout, so the hook's own extraction step becomes a no-op.
+$ffmpegWindowsZip = Join-Path $ffmpegWindowsRoot $ffmpegWindowsName
+$ffmpegWindowsExtractRoot = Join-Path $ffmpegWindowsRoot ([IO.Path]::GetFileNameWithoutExtension($ffmpegWindowsName))
+$ffmpegWindowsMarker = Join-Path $ffmpegWindowsExtractRoot '.extract_complete'
+$ffmpegWindowsHasPayload = $false
+if (Test-Path -LiteralPath $ffmpegWindowsExtractRoot) {
+    $ffmpegWindowsHasPayload = @(
+        Get-ChildItem -LiteralPath $ffmpegWindowsExtractRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '.extract_complete' }
+    ).Count -gt 0
+}
+if (-not $ffmpegWindowsHasPayload) {
+    if (Test-Path -LiteralPath $ffmpegWindowsExtractRoot) {
+        Remove-Item -LiteralPath $ffmpegWindowsExtractRoot -Recurse -Force
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ffmpegWindowsZip, $ffmpegWindowsExtractRoot)
+    New-Item -ItemType File -Force -Path $ffmpegWindowsMarker | Out-Null
+    Write-Host "Extracted $ffmpegWindowsName into the hook cache"
+}
+else {
+    if (-not (Test-Path -LiteralPath $ffmpegWindowsMarker)) {
+        New-Item -ItemType File -Force -Path $ffmpegWindowsMarker | Out-Null
+    }
+    Write-Host "Reused the extracted $ffmpegWindowsName payload"
+}
